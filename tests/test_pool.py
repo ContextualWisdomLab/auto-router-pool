@@ -29,6 +29,16 @@ class ScoreTest(unittest.TestCase):
 
 
 class PickTest(unittest.TestCase):
+    def test_primary_prefers_non_astra_within_quality_tolerance(self):
+        candidates = {
+            "brand-astra": {"high": {"index": 60, "in": 1, "out": 5}},
+            "brand-sol": {"high": {"index": 58, "in": 2, "out": 10}},
+        }
+        self.assertEqual(pool.pick_primary(candidates)[0], "brand-sol")
+        self.assertEqual(pool.pick(candidates, "high", 3, 12)[0], "brand-astra")
+        candidates["brand-sol"]["high"]["index"] = 57.9
+        self.assertEqual(pool.pick_primary(candidates)[0], "brand-astra")
+
     def test_quality_prefers_index_but_breaks_ties_on_price(self):
         chosen = pool.pick(CANDIDATES, "high", 12, 45)
         self.assertEqual(chosen[0], "model-premium")

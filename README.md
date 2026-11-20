@@ -30,7 +30,7 @@ the same model at `max`.
    | role | rule | cap (per 1M in/out) |
    |---|---|---|
    | `premium` | best index at `xhigh` | $12 / $45 |
-   | `primary` | best index at `high`, cheapest within 2 points | $3 / $12 |
+   | `primary` | within 2 points of the best at `high`, prefer models without the `-astra` suffix, then lowest price | $3 / $12 |
    | `budget` | best index per blended dollar at `medium` | $0.30 / $1.50 |
 
    The complexity classifier is pinned to the `runner_up` model with a 30s

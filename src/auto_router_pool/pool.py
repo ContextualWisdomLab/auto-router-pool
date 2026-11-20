@@ -4,18 +4,16 @@ from __future__ import annotations
 import hashlib
 import json
 
+ROUTING_POLICY_VERSION = 2
+
 
 def fingerprint(rows: list[dict], names: list[str]) -> str:
-    """Catalogue identity plus blocked flags.
-
-    Changes when a model is added, removed, blocked or unblocked upstream, which
-    is the only reason to spend Artificial Analysis traffic.
-    """
+    """Watch identity for the catalogue, blocked flags and routing policy."""
     blocked = sorted(
         (row["model_name"], bool((row.get("model_info") or {}).get("blocked")))
         for row in rows
     )
-    payload = json.dumps([sorted(names), blocked], sort_keys=True).encode()
+    payload = json.dumps([ROUTING_POLICY_VERSION, sorted(names), blocked]).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -81,6 +79,7 @@ def pick(
     *,
     mode: str = "quality",
     tolerance: float = 2.0,
+    deprioritize_suffix: str | None = None,
 ):
     """Choose a model under a price cap.
 
@@ -105,6 +104,14 @@ def pick(
         top = max(item[1] for item in scored)
         best = min(
             (item for item in scored if item[1] >= top - tolerance),
-            key=lambda item: item[3],
+            key=lambda item: (
+                deprioritize_suffix is not None
+                and item[0].lower().endswith(deprioritize_suffix),
+                item[3],
+            ),
         )
     return best[0], best[2], best[1], best[4]
+
+
+def pick_primary(candidates: dict[str, dict]):
+    return pick(candidates, "high", 3, 12, deprioritize_suffix="-astra")

@@ -36,6 +36,7 @@ from .pool import (
     group_state,
     input_window,
     pick,
+    pick_primary,
     score,
     score_hashes,
 )
@@ -157,7 +158,7 @@ def required_env(settings: "Settings") -> list[str]:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes (default: preview)")
-    parser.add_argument("--watch", action="store_true", help="exit unless the catalogue changed")
+    parser.add_argument("--watch", action="store_true", help="skip refresh when catalogue and policy match")
     parser.add_argument("--refresh-scores", action="store_true", help="re-read every AA page")
     parser.add_argument("--smoke", action="store_true", help="one tiny auto completion after applying")
     parser.add_argument("--env-file", type=Path, default=None, help="file with KEY=VALUE secrets")
@@ -262,7 +263,7 @@ def run(args) -> int:
     cache_path.write_text(json.dumps(cache))
 
     premium = pick(candidates, "xhigh", 12, 45)
-    primary = pick(candidates, "high", 3, 12)
+    primary = pick_primary(candidates)
     budget = pick(candidates, "medium", 0.30, 1.50, mode="value")
     if not (premium and primary and budget):
         print(json.dumps({"error": "insufficient valid candidates", "status": status}))
