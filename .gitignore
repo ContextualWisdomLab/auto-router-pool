@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+
+# runtime artefacts: state, score cache, rollback backups, logs
+auto-pool-state.json
+auto-pool-aa-cache.json
+auto-pool-before-*.json
+*.lock
+*.log
+.env

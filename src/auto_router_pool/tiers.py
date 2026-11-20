@@ -1,0 +1,98 @@
+"""Tier templates for the three auto-router models.
+
+Effort assignments come from the Artificial Analysis effort ladder, not from the
+tier name: a small model can lose about two thirds of its index at ``low``, so
+the light tiers run it at ``medium``/``high``; a frontier model gains well under
+a point from ``xhigh`` over ``high``, so ``xhigh`` is reserved for the top tier.
+"""
+from __future__ import annotations
+
+ROUTERS = ("auto", "auto-classify", "auto-strix")
+
+# Tier names are Korean because they are the router's published contract; the
+# classifier prompt refers to them by name.
+AUTO = {
+    "명시 정보 추출·단순 분류·고정 규칙 처리": "simple",
+    "문맥 기반 분류·관계 추출·의도별 라우팅": "context",
+    "시각 자료 해석·화면 조작·글쓰기": "visual",
+    "일상적인 코딩·데이터 분석·도구 사용": "daily",
+    "복잡한 코딩·시스템 설계·기업 지식 업무": "complex",
+    "고난도 과제·심화 검토": "review",
+    "최고난도 추론·심층 연구·복잡한 장기 작업": "frontier",
+}
+
+
+def _compact(tier_map: dict) -> dict:
+    """Drop padded or duplicate entries while preserving routing order."""
+    cleaned = {}
+    for tier, entries in tier_map.items():
+        seen, keep = set(), []
+        for model, effort in entries:
+            if not model or model in seen:
+                continue
+            seen.add(model)
+            keep.append((model, effort))
+        cleaned[tier] = keep
+    return cleaned
+
+
+def auto_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=()):
+    micro = list(micro)[:2] + [""] * (2 - len(list(micro)[:2]))
+    return _compact({
+        "명시 정보 추출·단순 분류·고정 규칙 처리": [
+            (budget, "medium"), (micro[0], "low"), (micro[1], "low"), (primary, "low")],
+        "문맥 기반 분류·관계 추출·의도별 라우팅": [
+            (budget, "high"), (micro[0], "medium"), (micro[1], "medium"), (primary, "medium")],
+        "시각 자료 해석·화면 조작·글쓰기": [
+            (primary, "medium"), (premium, "medium")],
+        "일상적인 코딩·데이터 분석·도구 사용": [
+            (primary, "medium"), (runner_up, "medium"), (premium, "medium")],
+        "복잡한 코딩·시스템 설계·기업 지식 업무": [
+            (primary, "high"), (premium, "high"), (runner_up, "high")],
+        "고난도 과제·심화 검토": [
+            (primary, "high"), (premium, "high"), (runner_up, "high")],
+        "최고난도 추론·심층 연구·복잡한 장기 작업": [
+            (premium, "xhigh"), (primary, "xhigh"), (runner_up, "xhigh")],
+    })
+
+
+def classify_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=()):
+    micro = list(micro)[:2] + [""] * (2 - len(list(micro)[:2]))
+    return _compact({
+        "SIMPLE": [(budget, "medium"), (micro[0], "low"), (micro[1], "low"), (primary, "low")],
+        "MEDIUM": [(budget, "high"), (micro[0], "medium"), (micro[1], "medium"), (primary, "medium")],
+        "COMPLEX": [(primary, "low"), (runner_up, "low"), (premium, "low")],
+        "REASONING": [(primary, "medium"), (runner_up, "medium"), (premium, "medium")],
+    })
+
+
+def strix_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=()):
+    micro = list(micro)[:2] + [""] * (2 - len(list(micro)[:2]))
+    return _compact({
+        "SIMPLE": [(budget, "medium"), (micro[0], "low"), (micro[1], "low")],
+        "MEDIUM": [(primary, "medium")],
+        "COMPLEX": [(primary, "high")],
+        "REASONING": [(primary, "xhigh")],
+    })
+
+
+def routers(primary: str, premium: str, budget: str, runner_up: str, micro=()):
+    """Map router name -> tier spec."""
+    return {
+        "auto": auto_tiers(primary, premium, budget, runner_up, micro),
+        "auto-classify": classify_tiers(primary, premium, budget, runner_up, micro),
+        "auto-strix": strix_tiers(primary, premium, budget, runner_up, micro),
+    }
+
+
+def build(tier_map: dict) -> tuple[dict, dict]:
+    """``(tiers, tier_model_configs)`` exactly as LiteLLM stores them."""
+    tiers = {name: [model for model, _ in entries] for name, entries in tier_map.items()}
+    configs = {
+        name: [
+            {"model_name": model, "litellm_params": {"reasoning_effort": effort}}
+            for model, effort in entries
+        ]
+        for name, entries in tier_map.items()
+    }
+    return tiers, configs
