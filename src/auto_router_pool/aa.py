@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.request
 
 DEFAULT_BASE = "https://artificialanalysis.ai/models/"
@@ -78,6 +79,12 @@ def get_variants(
         variants = parse_variants(fetch(base + slug), slug)
     except LayoutError:
         return (entry["variants"] if entry else {}), "missing_array"
+    except urllib.error.HTTPError as error:
+        # A 404 is the page saying "no such model", which is a skip, not a
+        # layout break; 5xx and 429 stay structural so they are retried.
+        if error.code == 404:
+            return (entry["variants"] if entry else {}), "no_aa_entry"
+        return (entry["variants"] if entry else {}), "fetch_error"
     except Exception:
         return (entry["variants"] if entry else {}), "fetch_error"
 

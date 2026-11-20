@@ -66,6 +66,11 @@ class CatalogueTest(unittest.TestCase):
                                info_row("__advisor_fable"), info_row("model-a")])
         self.assertEqual(found, ["model-a"])
 
+    def test_router_rows_are_not_candidates(self):
+        advisor = {"model_name": "auto-advisor", "model_info": {},
+                   "litellm_params": {"complexity_router_config": {"tiers": {}}}}
+        self.assertEqual(cli.catalogue([advisor, info_row("model-a")]), ["model-a"])
+
     def test_filters_apply_to_both_sources(self):
         self.assertEqual(cli.catalogue(self.ROWS, "brand-2", ("astra",)),
                          ["brand-2-astra"])

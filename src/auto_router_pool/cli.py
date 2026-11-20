@@ -115,8 +115,17 @@ def discover(client: Client, prefix: str = "", suffixes=()) -> list[str]:
 
 
 def catalogue(rows: list[dict], prefix: str = "", suffixes=()) -> list[str]:
-    """Candidate ids from LiteLLM's own catalogue, used when no proxy is set."""
-    return filtered([row["model_name"] for row in rows], prefix, suffixes)
+    """Candidate ids from LiteLLM's own catalogue, used when no proxy is set.
+
+    A row carrying a complexity router config is a router rather than a model,
+    so it is never a candidate however it is named.
+    """
+    names = [
+        row["model_name"]
+        for row in rows
+        if "complexity_router_config" not in (row.get("litellm_params") or {})
+    ]
+    return filtered(names, prefix, suffixes)
 
 
 def load_json(path: Path) -> dict:

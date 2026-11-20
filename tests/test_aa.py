@@ -1,5 +1,6 @@
 import json
 import unittest
+import urllib.error
 
 from auto_router_pool import aa
 
@@ -35,6 +36,21 @@ class ParseTest(unittest.TestCase):
     def test_missing_array_raises(self):
         with self.assertRaises(aa.LayoutError):
             aa.parse_variants("<html>client side only</html>", "brand-2-sol")
+
+
+class NotFoundTest(unittest.TestCase):
+    def fetch(self, code):
+        def call(url):
+            raise urllib.error.HTTPError(url, code, "x", {}, None)
+        return call
+
+    def test_404_is_a_skip_not_a_layout_break(self):
+        variants, error = aa.get_variants("brand-9-sol", {}, fetch=self.fetch(404))
+        self.assertEqual((variants, error), ({}, "no_aa_entry"))
+
+    def test_other_http_errors_stay_structural(self):
+        variants, error = aa.get_variants("brand-2-sol", {}, fetch=self.fetch(503))
+        self.assertEqual((variants, error), ({}, "fetch_error"))
 
 
 class CacheTest(unittest.TestCase):

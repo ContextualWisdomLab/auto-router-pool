@@ -97,7 +97,7 @@ closed when nothing qualifies.
 | situation | result |
 |---|---|
 | page layout changed, model uncached | `{"result": "aa_unparseable"}`, exit 1, **no state write** → retried next run |
-| page parsed, model not benchmarked | `no_aa_entry`, model skipped |
+| page parsed, model not benchmarked, or its page 404s | `no_aa_entry`, model skipped |
 | cached model, page now broken | last known numbers used until the cache expires |
 | `LITELLM_MASTER_KEY` missing | `{"error": "missing environment"}`, exit 1 |
 | another run holds the lock | `{"skipped": "locked"}`, exit 0 |
