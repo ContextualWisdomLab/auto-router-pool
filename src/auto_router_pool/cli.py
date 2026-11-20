@@ -17,7 +17,15 @@ from pathlib import Path
 
 from . import aa
 from .apply import apply as apply_changes
-from .apply import backup, context_drift, plan, set_auto_fallback, smoke, validate
+from .apply import (
+    backup,
+    classifier_drift,
+    context_drift,
+    plan,
+    set_auto_fallback,
+    smoke,
+    validate,
+)
 from .client import Client, models, probe
 from .pool import (
     MIN_INPUT_TOKENS,
@@ -176,6 +184,7 @@ def run(args) -> int:
         args.watch
         and state.get("fingerprint") == current_fp
         and not context_drift(rows, ROUTERS)
+        and not classifier_drift(rows, ROUTERS)
     ):
         print(json.dumps({"skipped": "no catalogue change", "fingerprint": current_fp[:12]}))
         return 0
@@ -258,6 +267,7 @@ def run(args) -> int:
         rows,
         routers(primary[0], premium[0], budget[0], runner_up, micro),
         primary[0],
+        runner_up,
     )
     summary = {
         "pool": {

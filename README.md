@@ -30,8 +30,12 @@ the same model at `max`.
    | `primary` | best index at `high`, cheapest within 2 points | $3 / $12 |
    | `budget` | best index per blended dollar at `medium` | $0.30 / $1.50 |
 
-5. **Diff** each router's tiers, efforts and context floor, validate server-side,
-   back up, patch, re-read, and roll back on any mismatch.
+   The complexity classifier is pinned to the `runner_up` model with a 30s
+   timeout. It runs on every routed request, so it must be a model the router
+   already selects and one with headroom: a stale classifier times out, and the
+   cheapest model is usually the first to be rate-limited.
+5. **Diff** each router's tiers, efforts, context floor and classifier, validate
+   server-side, back up, patch, re-read, and roll back on any mismatch.
 6. **Cap the advertised window** at the smallest `max_input_tokens` among the
    models its own tiers can select, so a router never advertises more context
    than the weakest solver it can hand a request to. Only models at or above the 272k input floor can be selected, so the advertised

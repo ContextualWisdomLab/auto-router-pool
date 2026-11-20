@@ -8,6 +8,8 @@ from pathlib import Path
 
 from .tiers import build
 
+CLASSIFIER_TIMEOUT_MS = 30_000
+
 
 def context_cap(rows: list[dict], tiers: dict) -> int | None:
     """Smallest declared input window among the models a router can select.
@@ -49,8 +51,33 @@ def context_drift(rows: list[dict], names=()) -> list[str]:
     return drift
 
 
-def plan(rows: list[dict], routers: dict, default: str):
-    """Return only the routers whose tiers, efforts or context floor differ."""
+def classifier_drift(rows: list[dict], names=()) -> list[str]:
+    """Routers whose classifier is foreign to their own tiers or too impatient.
+
+    A classifier pointing at a model the router no longer selects times out and
+    silently disables tiering, so it counts as drift even when the tiers match.
+    """
+    watched = set(names)
+    drift = []
+    for row in rows:
+        if watched and row["model_name"] not in watched:
+            continue
+        config = (row.get("litellm_params") or {}).get("complexity_router_config") or {}
+        tiers = config.get("tiers")
+        if not isinstance(tiers, dict) or not tiers:
+            continue
+        models = {model for entries in tiers.values() for model in entries if model}
+        classifier = config.get("classifier_llm_config") or {}
+        if (
+            classifier.get("model") not in models
+            or (classifier.get("timeout_ms") or 0) < CLASSIFIER_TIMEOUT_MS
+        ):
+            drift.append(row["model_name"])
+    return drift
+
+
+def plan(rows: list[dict], routers: dict, default: str, classifier: str | None = None):
+    """Return only the routers whose tiers, efforts, context floor or classifier differ."""
     by_name = {row["model_name"]: row for row in rows}
     changes = []
     for name, tier_map in routers.items():
@@ -63,12 +90,19 @@ def plan(rows: list[dict], routers: dict, default: str):
             config.get("tiers") != tiers
             or config.get("tier_model_configs") != configs
         )
+        classifier_changed = False
+        if classifier:
+            current = config.get("classifier_llm_config") or {}
+            classifier_changed = (
+                current.get("model") != classifier
+                or (current.get("timeout_ms") or 0) < CLASSIFIER_TIMEOUT_MS
+            )
         cap = context_cap(rows, tiers)
         cap_changed = (
             cap is not None
             and (row.get("model_info") or {}).get("max_input_tokens") != cap
         )
-        if not params_changed and not cap_changed:
+        if not params_changed and not cap_changed and not classifier_changed:
             continue
         change = {
             "model_name": name,
@@ -78,10 +112,19 @@ def plan(rows: list[dict], routers: dict, default: str):
                 "max_input_tokens"
             ),
         }
-        if params_changed:
+        if classifier:
+            change["classifier"] = classifier
+        if params_changed or classifier_changed:
             config["tiers"] = tiers
             config["tier_model_configs"] = configs
             config["default_model"] = default
+            if classifier:
+                current = dict(config.get("classifier_llm_config") or {})
+                current["model"] = classifier
+                current["timeout_ms"] = max(
+                    int(current.get("timeout_ms") or 0), CLASSIFIER_TIMEOUT_MS
+                )
+                config["classifier_llm_config"] = current
             change["config"] = config
             change["litellm_params"] = {
                 **row["litellm_params"],
@@ -149,7 +192,16 @@ def apply(client, changes: list[dict]):
         got = after.get(change["model_name"], {})
         if "config" in change:
             actual = got.get("litellm_params", {}).get("complexity_router_config", {})
-            if actual.get("tiers") != change["config"]["tiers"]:
+            classifier = change.get("classifier")
+            actual_classifier = actual.get("classifier_llm_config") or {}
+            if actual.get("tiers") != change["config"]["tiers"] or (
+                classifier
+                and (
+                    actual_classifier.get("model") != classifier
+                    or (actual_classifier.get("timeout_ms") or 0)
+                    < CLASSIFIER_TIMEOUT_MS
+                )
+            ):
                 for old in changes:
                     client.patch(f"/model/{old['id']}/update", _patch_body(old, rollback=True))
                 raise RuntimeError("verification failed; rolled back")

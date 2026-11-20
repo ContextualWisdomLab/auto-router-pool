@@ -81,6 +81,52 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(apply.plan(rows, {"auto": {"SIMPLE": [("small", "low")]}}, "small"), [])
 
 
+class ClassifierTest(unittest.TestCase):
+    def row_with_classifier(self, model_name, timeout, tiers=None):
+        row = router("auto", 400000, tiers or {"SIMPLE": [("small", "low")], "MEDIUM": [("budget", "high")]})
+        row["litellm_params"]["complexity_router_config"]["classifier_llm_config"] = {
+            "model": model_name,
+            "timeout_ms": timeout,
+        }
+        return row
+
+    def test_plan_pins_classifier_to_budget(self):
+        rows = [self.row_with_classifier("luna", 10000), model("small", 400000), model("budget", 400000)]
+        changes = apply.plan(rows, {"auto": {"SIMPLE": [("small", "low")], "MEDIUM": [("budget", "high")]}}, "small", "budget")
+        self.assertEqual(len(changes), 1)
+        classifier = changes[0]["config"]["classifier_llm_config"]
+        self.assertEqual(classifier["model"], "budget")
+        self.assertEqual(classifier["timeout_ms"], apply.CLASSIFIER_TIMEOUT_MS)
+
+    def test_pinned_classifier_is_unchanged(self):
+        rows = [self.row_with_classifier("budget", apply.CLASSIFIER_TIMEOUT_MS),
+                model("small", 400000), model("budget", 400000)]
+        self.assertEqual(
+            apply.plan(rows, {"auto": {"SIMPLE": [("small", "low")], "MEDIUM": [("budget", "high")]}}, "small", "budget"),
+            [],
+        )
+
+    def test_classifier_drift_flags_foreign_model(self):
+        rows = [self.row_with_classifier("luna", 30000)]
+        self.assertEqual(apply.classifier_drift(rows), ["auto"])
+
+    def test_classifier_drift_flags_short_timeout(self):
+        rows = [self.row_with_classifier("small", 10000)]
+        self.assertEqual(apply.classifier_drift(rows), ["auto"])
+
+    def test_classifier_drift_ignores_matching_config(self):
+        rows = [self.row_with_classifier("small", apply.CLASSIFIER_TIMEOUT_MS)]
+        self.assertEqual(apply.classifier_drift(rows), [])
+
+    def test_classifier_change_is_verified(self):
+        rows = [self.row_with_classifier("luna", 10000), model("small", 400000), model("budget", 400000)]
+        client = FakeClient(rows)
+        changes = apply.plan(rows, {"auto": {"SIMPLE": [("small", "low")], "MEDIUM": [("budget", "high")]}}, "small", "budget")
+        apply.apply(client, changes)
+        classifier = rows[0]["litellm_params"]["complexity_router_config"]["classifier_llm_config"]
+        self.assertEqual(classifier["model"], "budget")
+
+
 class ApplyTest(unittest.TestCase):
     def test_apply_patches_cap_and_verifies(self):
         rows = [router("auto", 500000, {"SIMPLE": [("small", "low")]}), model("small", 131072)]
