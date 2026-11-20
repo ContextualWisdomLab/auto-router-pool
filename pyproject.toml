@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-router-pool"
-version = "0.1.0"
+version = "0.2.0"
 description = "Keep LiteLLM complexity routers on the best index-per-dollar model that is actually reachable"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ dependencies = []
 
 [project.scripts]
 auto-router-pool = "auto_router_pool.cli:main"
+auto-router-pool-chains = "auto_router_pool.live:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

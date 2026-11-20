@@ -17,10 +17,19 @@ from pathlib import Path
 
 from . import aa
 from .apply import apply as apply_changes
-from .apply import backup, plan, set_auto_fallback, smoke, validate
+from .apply import backup, context_drift, plan, set_auto_fallback, smoke, validate
 from .client import Client, models, probe
-from .pool import changed_scores, fingerprint, group_state, pick, score, score_hashes
-from .tiers import routers
+from .pool import (
+    MIN_INPUT_TOKENS,
+    changed_scores,
+    fingerprint,
+    group_state,
+    input_window,
+    pick,
+    score,
+    score_hashes,
+)
+from .tiers import ROUTERS, routers
 
 
 def default_home() -> Path:
@@ -163,7 +172,11 @@ def run(args) -> int:
     state_path = settings.home / "auto-pool-state.json"
     cache_path = settings.home / "auto-pool-aa-cache.json"
     state = load_json(state_path)
-    if args.watch and state.get("fingerprint") == current_fp:
+    if (
+        args.watch
+        and state.get("fingerprint") == current_fp
+        and not context_drift(rows, ROUTERS)
+    ):
         print(json.dumps({"skipped": "no catalogue change", "fingerprint": current_fp[:12]}))
         return 0
 
@@ -235,9 +248,15 @@ def run(args) -> int:
         print(json.dumps({"error": "no runner-up candidate", "status": status}))
         return 1
 
+    # A micro model below the context floor cannot serve this router at all, so
+    # it is dropped from the light tiers instead of loweriing their window.
+    micro = [name for name in settings.micro if input_window(rows, name) >= MIN_INPUT_TOKENS]
+    for name in settings.micro:
+        if name not in micro:
+            status[name] = "context_below_floor"
     changes = plan(
         rows,
-        routers(primary[0], premium[0], budget[0], runner_up, settings.micro),
+        routers(primary[0], premium[0], budget[0], runner_up, micro),
         primary[0],
     )
     summary = {
@@ -254,7 +273,13 @@ def run(args) -> int:
         },
         "score_updates": updates,
         "status": status,
+        "minimum_input_tokens": MIN_INPUT_TOKENS,
         "changed": len(changes),
+        "max_input_tokens": {
+            change["model_name"]: change["model_info"]["max_input_tokens"]
+            for change in changes
+            if change.get("model_info")
+        },
     }
 
     if not changes:

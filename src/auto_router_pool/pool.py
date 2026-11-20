@@ -36,13 +36,31 @@ def changed_scores(hashes: dict[str, str], previous: dict[str, str]) -> list[str
     )
 
 
-def group_state(rows: list[dict], name: str):
-    """``(usable, reason)`` based on registration and blocked flags only."""
+# Operators only route long-context traffic, so a group below this window is not
+# a candidate: it would either be filtered out per request or truncate silently.
+MIN_INPUT_TOKENS = 272_000
+
+
+def input_window(rows: list[dict], name: str) -> int:
+    """Largest declared input window in a group; 0 when nothing is declared."""
+    values = [
+        (row.get("model_info") or {}).get("max_input_tokens")
+        for row in rows
+        if row["model_name"] == name
+    ]
+    known = [value for value in values if type(value) is int and value > 0]
+    return max(known) if known else 0
+
+
+def group_state(rows: list[dict], name: str, minimum: int = MIN_INPUT_TOKENS):
+    """``(usable, reason)`` based on registration, blocked flags and context."""
     group = [row for row in rows if row["model_name"] == name]
     if not group:
         return False, "unregistered"
     if all((row.get("model_info") or {}).get("blocked") for row in group):
         return False, "all_blocked"
+    if input_window(rows, name) < minimum:
+        return False, "context_below_floor"
     return True, "registered"
 
 

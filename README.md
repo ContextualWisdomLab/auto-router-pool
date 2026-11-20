@@ -15,9 +15,11 @@ the same model at `max`.
 ## What one run does
 
 1. **Discover** model ids from the catalogue, narrowed by `--prefix` / `--suffixes`.
-2. **Filter to valid models**: at least one unblocked deployment, and a one-token
-   probe that is not rejected with 400/403/404. `429` and `5xx` are treated as
-   transient, so a rate-limited model is never demoted.
+2. **Filter to valid models**: a declared input window of at least 272,000
+   tokens, at least one unblocked deployment, and a one-token probe that is not
+   rejected with 400/403/404. `429` and `5xx` are treated as transient, so a
+   rate-limited model is never demoted. A model below the 272k floor is never a
+   candidate or a `--micro` entry.
 3. **Fetch scores** from the Artificial Analysis model page, cached per slug.
 4. **Pick roles** under price caps:
 
@@ -27,8 +29,13 @@ the same model at `max`.
    | `primary` | best index at `high`, cheapest within 2 points | $3 / $12 |
    | `budget` | best index per blended dollar at `medium` | $0.30 / $1.50 |
 
-5. **Diff** each router's tiers and efforts, validate server-side, back up, patch,
-   re-read, and roll back on any mismatch.
+5. **Diff** each router's tiers, efforts and context floor, validate server-side,
+   back up, patch, re-read, and roll back on any mismatch.
+6. **Cap the advertised window** at the smallest `max_input_tokens` among the
+   models its own tiers can select, so a router never advertises more context
+   than the weakest solver it can hand a request to. Only models at or above the 272k input floor can be selected, so the advertised
+   window lands on the weakest *eligible* solver. A solver with no declared
+   window proves no floor, so that router is left alone instead of guessed.
 
 An unchanged pool writes nothing.
 
@@ -50,8 +57,10 @@ tiers run it at `medium`/`high`. The primary variant gains under a point from
 ## Cadence
 
 `--watch` compares a fingerprint of the catalogue and blocked flags and exits
-immediately when nothing changed. That makes a 15-minute cron cheap: no token
-spend, no score traffic.
+immediately when nothing changed. A context floor that drifted from its own
+tiers also forces a run, so a cap change is never masked by an unchanged
+catalogue. That keeps a 15-minute cron cheap: no token spend, no score traffic
+unless something is actually out of date.
 
 ```cron
 */15 * * * * cd /path/to/auto-router-pool && PYTHONPATH=src /usr/bin/python3 -m auto_router_pool.cli --watch --apply >> "$HOME/.local/state/auto-router-pool/refresh.log" 2>&1
@@ -60,6 +69,20 @@ spend, no score traffic.
 Scores are cached for 7 days (`AA_TTL`) because a released model's index barely
 moves; a newly registered model has no cache entry and is fetched on first sight.
 Use `--refresh-scores` to re-read everything on demand.
+
+## Chain hygiene
+
+`auto-router-pool-chains` keeps `fallbacks` usable on its own schedule: it drops
+targets that are blocked or below the 272k floor, ends every chain on a live
+resort, and never lets the resort keep a chain of its own (which could close a
+cycle). The resort is chosen from the catalogue — the cheapest model from a
+family the auto tiers do not already use — and an incumbent keeps the role while
+it still qualifies, so a transient price change cannot churn the graph. It fails
+closed when nothing qualifies.
+
+```cron
+11,26,41,56 * * * * /usr/bin/python3 /path/to/ensure_live_fallbacks.py
+```
 
 ## Failure behaviour
 

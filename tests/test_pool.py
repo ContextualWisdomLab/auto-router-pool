@@ -90,13 +90,39 @@ class GroupStateTest(unittest.TestCase):
 
     def test_one_unblocked_deployment_is_enough(self):
         rows = [
-            {"model_name": "m", "model_info": {"blocked": True}},
-            {"model_name": "m", "model_info": {"blocked": False}},
+            {"model_name": "m", "model_info": {"blocked": True, "max_input_tokens": 400000}},
+            {"model_name": "m", "model_info": {"blocked": False, "max_input_tokens": 400000}},
         ]
         self.assertTrue(pool.group_state(rows, "m")[0])
 
     def test_unregistered(self):
         self.assertEqual(pool.group_state([], "m"), (False, "unregistered"))
+
+
+class ContextFloorTest(unittest.TestCase):
+    def rows(self, *windows):
+        return [
+            {"model_name": "m", "model_info": {"blocked": False, "max_input_tokens": window}}
+            for window in windows
+        ]
+
+    def test_window_uses_largest_deployment(self):
+        self.assertEqual(pool.input_window(self.rows(131072, 400000), "m"), 400000)
+
+    def test_undeclared_window_is_zero(self):
+        self.assertEqual(pool.input_window([{"model_name": "m", "model_info": {}}], "m"), 0)
+
+    def test_smaller_than_floor_is_unusable(self):
+        self.assertEqual(pool.group_state(self.rows(131072), "m"), (False, "context_below_floor"))
+
+    def test_floor_is_inclusive(self):
+        self.assertTrue(pool.group_state(self.rows(272000), "m")[0])
+
+    def test_custom_floor(self):
+        self.assertEqual(
+            pool.group_state(self.rows(400000), "m", minimum=500000),
+            (False, "context_below_floor"),
+        )
 
 
 if __name__ == "__main__":
