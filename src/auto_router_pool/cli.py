@@ -2,7 +2,9 @@
 
 Nothing environment-specific is baked in: ports, model family, micro models and
 the state directory all come from flags or environment variables, so this file
-is safe to publish and reusable against any OpenAI-compatible proxy pair.
+is safe to publish and reusable against any OpenAI-compatible catalogue. A
+separate catalogue proxy (CLIProxyAPI) is optional: without one, candidate ids
+come from LiteLLM's own catalogue.
 """
 from __future__ import annotations
 
@@ -87,14 +89,16 @@ def load_env(path: Path | None = None):
         os.environ.setdefault(name.strip(), value.strip())
 
 
-def discover(client: Client, prefix: str = "", suffixes=()) -> list[str]:
-    """Catalogue model ids, optionally narrowed by name prefix and suffix."""
-    payload = client.get("/v1/models")
-    names = [item["id"] for item in payload.get("data", [])]
+def filtered(names, prefix: str = "", suffixes=()) -> list[str]:
+    """Direct model ids, optionally narrowed by name prefix and suffix.
+
+    Managed routers and internal advisory groups are never candidates, whichever
+    catalogue they came from.
+    """
     allowed = tuple(suffixes)
     found = []
     for name in names:
-        if "/" in name:
+        if not name or "/" in name or name in ROUTERS or name.startswith("__"):
             continue
         if prefix and not name.startswith(prefix):
             continue
@@ -102,6 +106,17 @@ def discover(client: Client, prefix: str = "", suffixes=()) -> list[str]:
             continue
         found.append(name)
     return sorted(set(found))
+
+
+def discover(client: Client, prefix: str = "", suffixes=()) -> list[str]:
+    """Catalogue model ids from an optional catalogue proxy."""
+    payload = client.get("/v1/models")
+    return filtered([item["id"] for item in payload.get("data", [])], prefix, suffixes)
+
+
+def catalogue(rows: list[dict], prefix: str = "", suffixes=()) -> list[str]:
+    """Candidate ids from LiteLLM's own catalogue, used when no proxy is set."""
+    return filtered([row["model_name"] for row in rows], prefix, suffixes)
 
 
 def load_json(path: Path) -> dict:
@@ -125,6 +140,11 @@ def csv(value) -> tuple[str, ...]:
     return tuple(part.strip() for part in (value or "").split(",") if part.strip())
 
 
+def required_env(settings: "Settings") -> list[str]:
+    """Only the LiteLLM admin key is mandatory; a catalogue proxy is optional."""
+    return [name for name, value in (("LITELLM_MASTER_KEY", settings.key),) if not value]
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes (default: preview)")
@@ -145,14 +165,7 @@ def run(args) -> int:
         settings.home = args.home
     if args.micro is not None:
         settings.micro = csv(args.micro)
-    missing = [
-        name
-        for name, value in (
-            ("LITELLM_MASTER_KEY", settings.key),
-            ("CPAPI_API_KEY", settings.cpkey),
-        )
-        if not value
-    ]
+    missing = required_env(settings)
     if missing:
         print(json.dumps({"error": "missing environment", "names": missing}))
         return 1
@@ -168,10 +181,15 @@ def run(args) -> int:
         return 0
 
     litellm = Client(settings.litellm_base, settings.key)
-    cliproxy = Client(settings.cliproxy_base, settings.cpkey, timeout=30)
-
     rows = models(litellm)
-    names = discover(cliproxy, args.prefix, csv(args.suffixes))
+
+    if settings.cpkey:
+        cliproxy = Client(settings.cliproxy_base, settings.cpkey, timeout=30)
+        names = discover(cliproxy, args.prefix, csv(args.suffixes))
+        source = "cliproxy"
+    else:
+        names = catalogue(rows, args.prefix, csv(args.suffixes))
+        source = "litellm"
     if not names:
         print(json.dumps({"error": "no models discovered"}))
         return 1
@@ -270,6 +288,7 @@ def run(args) -> int:
         runner_up,
     )
     summary = {
+        "catalogue": source,
         "pool": {
             "premium": premium[0],
             "primary": primary[0],

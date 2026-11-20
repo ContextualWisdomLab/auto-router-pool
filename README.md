@@ -14,8 +14,11 @@ the same model at `max`.
 
 ## What one run does
 
-1. **Discover** model ids from the catalogue, optionally narrowed by `--prefix` /
-   `--suffixes`; with neither flag the whole catalogue is considered.
+1. **Discover** model ids, optionally narrowed by `--prefix` / `--suffixes`; with
+   neither flag the whole catalogue is considered. Candidates come from
+   LiteLLM's own `/model/info` by default, so no extra service is required; a
+   separate catalogue proxy (CLIProxyAPI) is used only when `CPAPI_API_KEY` is
+   set, which keeps `/v1/models` authoritative for setups that prefer it.
 2. **Filter to valid models**: a declared input window of at least 272,000
    tokens, at least one unblocked deployment, and a one-token probe that is not
    rejected with 400/403/404. `429` and `5xx` are treated as transient, so a
@@ -96,7 +99,7 @@ closed when nothing qualifies.
 | page layout changed, model uncached | `{"result": "aa_unparseable"}`, exit 1, **no state write** → retried next run |
 | page parsed, model not benchmarked | `no_aa_entry`, model skipped |
 | cached model, page now broken | last known numbers used until the cache expires |
-| missing credentials | `{"error": "missing environment"}`, exit 1 |
+| `LITELLM_MASTER_KEY` missing | `{"error": "missing environment"}`, exit 1 |
 | another run holds the lock | `{"skipped": "locked"}`, exit 0 |
 | server rejects a tier config | `{"result": "rejected"}`, exit 1, nothing written |
 | patch does not persist | all routers restored from the backup |
@@ -118,9 +121,9 @@ Requires Python 3.10+. No third-party runtime dependencies.
 | variable | default | meaning |
 |---|---|---|
 | `LITELLM_MASTER_KEY` | — | LiteLLM admin key (required) |
-| `CPAPI_API_KEY` | — | catalogue proxy key (required) |
+| `CPAPI_API_KEY` | — | optional catalogue proxy key; unset means LiteLLM is the catalogue |
 | `LITELLM_BASE` | `http://127.0.0.1:4000` | LiteLLM base URL |
-| `CLIPROXY_BASE` | `http://127.0.0.1:8317` | catalogue base URL |
+| `CLIPROXY_BASE` | `http://127.0.0.1:8317` | catalogue proxy base URL, used only with `CPAPI_API_KEY` |
 | `AA_BASE` | `https://artificialanalysis.ai/models/` | score source, override for tests |
 | `AA_TTL` | `604800` | score cache lifetime, seconds |
 | `AUTO_POOL_HOME` | `~/.local/state/auto-router-pool` | state, cache, backups, lock |
@@ -128,6 +131,11 @@ Requires Python 3.10+. No third-party runtime dependencies.
 
 Flags: `--apply`, `--watch`, `--refresh-scores`, `--smoke`, `--prefix`,
 `--suffixes`, `--micro`, `--home`, `--env-file`.
+
+The catalogue proxy is a convenience, not a dependency: `CPAPI_API_KEY` unset
+means candidate ids are read from LiteLLM's `/model/info`, where the managed
+routers and `__`-prefixed advisory groups are skipped either way. The run report
+names the source in `catalogue` (`litellm` or `cliproxy`).
 
 Nothing about a particular deployment is hardcoded: model families, the small
 models used for light tiers, and every path are supplied by the caller. The
