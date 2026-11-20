@@ -14,7 +14,8 @@ the same model at `max`.
 
 ## What one run does
 
-1. **Discover** model ids from the catalogue, narrowed by `--prefix` / `--suffixes`.
+1. **Discover** model ids from the catalogue, optionally narrowed by `--prefix` /
+   `--suffixes`; with neither flag the whole catalogue is considered.
 2. **Filter to valid models**: a declared input window of at least 272,000
    tokens, at least one unblocked deployment, and a one-token probe that is not
    rejected with 400/403/404. `429` and `5xx` are treated as transient, so a
@@ -152,5 +153,6 @@ change.
   tiers and models, solved per day rather than per request.
 - **Single host.** State is a local JSON file and the lock is `flock`; a
   multi-worker deployment needs shared state and a distributed lock.
-- **Discovery is name-based.** A model registered under an unexpected name is
-  ignored until `--prefix`/`--suffixes` change.
+- **Discovery is name-based.** Ids are taken from the catalogue verbatim and
+  ids containing `/` are skipped; use `--prefix`/`--suffixes` to keep a pool in
+  one family when the catalogue mixes vendors.
