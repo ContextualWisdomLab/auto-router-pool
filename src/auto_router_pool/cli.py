@@ -35,7 +35,6 @@ from .pool import (
     fingerprint,
     flaky_deployments,
     group_state,
-    input_window,
     pick,
     pick_primary,
     score,
@@ -222,6 +221,31 @@ def triage_deployments(litellm, rows, name, *, apply=False):
     return blocked, "blocked"
 
 
+def usable_micro(litellm, rows, candidates, requested):
+    """Micro models that can serve this run.
+
+    A candidate already passed this run's probe. A requested model outside the
+    candidate set is checked against registration and blocked flags, then probed
+    once, so a rate-limited micro model is not written back into a light tier
+    just because its declared window is large.
+    """
+    chosen = []
+    reasons = {}
+    for name in requested:
+        usable, reason = group_state(rows, name)
+        if not usable:
+            reasons[name] = reason
+        elif name in candidates:
+            chosen.append(name)
+        else:
+            ok, reason = probe(litellm, name)
+            if ok:
+                chosen.append(name)
+            else:
+                reasons[name] = reason
+    return chosen, reasons
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes (default: preview)")
@@ -393,12 +417,10 @@ def run(args) -> int:
         print(json.dumps({"error": "no runner-up candidate", "status": status}))
         return 1
 
-    # A micro model below the context floor cannot serve this router at all, so
-    # it is dropped from the light tiers instead of loweriing their window.
-    micro = [name for name in settings.micro if input_window(rows, name) >= MIN_INPUT_TOKENS]
-    for name in settings.micro:
-        if name not in micro:
-            status[name] = "context_below_floor"
+    # A micro model that cannot serve this run is dropped from the light tiers
+    # instead of being written back because its declared window is large enough.
+    micro, micro_status = usable_micro(litellm, rows, candidates, settings.micro)
+    status.update(micro_status)
     top = {name: top_effort(variants) for name, variants in candidates.items()}
     changes = plan(
         rows,

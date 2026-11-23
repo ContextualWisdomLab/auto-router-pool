@@ -146,6 +146,34 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(result["error_status"], "unreachable")
 
 
+class MicroTest(unittest.TestCase):
+    def row(self, name):
+        return {"model_name": name, "model_info": {"max_input_tokens": 400000}}
+
+    def test_probe_failure_is_dropped(self):
+        micro, reasons = cli.usable_micro(
+            StubClient({"error_status": 429}), [self.row("micro")], {}, ["micro"]
+        )
+        self.assertEqual(micro, [])
+        self.assertEqual(reasons, {"micro": "unavailable_429"})
+
+    def test_candidate_is_not_probed_again(self):
+        class NoProbe:
+            def post(self, *args, **kwargs):
+                raise AssertionError("a candidate micro model was probed again")
+
+        micro, reasons = cli.usable_micro(
+            NoProbe(), [self.row("micro")], {"micro": {}}, ["micro"]
+        )
+        self.assertEqual(micro, ["micro"])
+        self.assertEqual(reasons, {})
+
+    def test_unregistered_micro_is_dropped(self):
+        micro, reasons = cli.usable_micro(StubClient({}), [], {}, ["ghost"])
+        self.assertEqual(micro, [])
+        self.assertEqual(reasons, {"ghost": "unregistered"})
+
+
 class DeploymentClient:
     def __init__(self, health_states, block_result=None):
         self.health_states = {key: list(value) for key, value in health_states.items()}

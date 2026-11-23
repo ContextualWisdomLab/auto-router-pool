@@ -44,14 +44,14 @@ class RoutersTest(unittest.TestCase):
     def test_top_tier_uses_each_models_peak_effort(self):
         routers = tiers.routers(
             "primary", "premium", "budget", "runner-up", (),
-            {"premium": "xhigh", "primary": "xhigh", "runner-up": "max"},
+            {"premium": "xhigh", "primary": "max", "runner-up": "max"},
         )
         frontier = routers["auto"]["최고난도 추론·심층 연구·복잡한 장기 작업"]
         self.assertEqual(
             frontier,
-            [("premium", "xhigh"), ("primary", "xhigh"), ("runner-up", "max")],
+            [("premium", "xhigh"), ("primary", "max"), ("runner-up", "max")],
         )
-        self.assertEqual(routers["auto-strix"]["REASONING"], [("primary", "xhigh")])
+        self.assertEqual(routers["auto-strix"]["REASONING"], [("primary", "max")])
 
 
 class TopEffortTest(unittest.TestCase):

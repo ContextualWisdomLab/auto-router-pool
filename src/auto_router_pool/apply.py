@@ -216,7 +216,14 @@ def apply(client, changes: list[dict]):
 
 def set_auto_fallback(client, chain: list[str]):
     """Replace only the ``auto`` edge, preserving every other fallback."""
-    settings = client.get("/router/settings").get("current_values", {})
+    result = client.get("/router/settings")
+    if result.get("error_status") is not None:
+        # A failed read must not look like an empty fallback list: the following
+        # /config/update would replace every existing edge with only ``auto``.
+        raise RuntimeError(
+            f"router settings unavailable ({result['error_status']}); fallbacks unchanged"
+        )
+    settings = result.get("current_values", {})
     edges: dict[str, list[str]] = {}
     for entry in settings.get("fallbacks") or []:
         source, targets = next(iter(entry.items()))
