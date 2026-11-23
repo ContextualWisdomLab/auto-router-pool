@@ -2,8 +2,9 @@
 
 Effort assignments come from the Artificial Analysis effort ladder, not from the
 tier name: a small model can lose about two thirds of its index at ``low``, so
-the light tiers run it at ``medium``/``high``; a frontier model gains well under
-a point from ``xhigh`` over ``high``, so ``xhigh`` is reserved for the top tier.
+the light tiers run it at ``medium``/``high``; the top tiers use each model's
+measured peak effort, which is not always the same label (``max`` beats
+``xhigh`` for some models, and loses for others).
 """
 from __future__ import annotations
 
@@ -22,6 +23,16 @@ AUTO = {
 }
 
 
+def top_effort(variants: dict) -> str:
+    """Effort where this model measured its highest index.
+
+    ``max`` is not always above ``xhigh`` (claude-fable-5-1 loses 0.9 at max),
+    so the top tier reads the ladder instead of assuming a label.
+    """
+    ranked = [(entry.get("index") or 0, effort) for effort, entry in variants.items()]
+    return max(ranked)[1] if ranked else "xhigh"
+
+
 def _compact(tier_map: dict) -> dict:
     """Drop padded or duplicate entries while preserving routing order."""
     cleaned = {}
@@ -36,8 +47,9 @@ def _compact(tier_map: dict) -> dict:
     return cleaned
 
 
-def auto_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=()):
+def auto_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=(), top=None):
     micro = list(micro)[:2] + [""] * (2 - len(list(micro)[:2]))
+    top = top or {}
     return _compact({
         "명시 정보 추출·단순 분류·고정 규칙 처리": [
             (budget, "medium"), (micro[0], "low"), (micro[1], "low"), (primary, "low")],
@@ -52,7 +64,9 @@ def auto_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=()
         "고난도 과제·심화 검토": [
             (primary, "high"), (premium, "high"), (runner_up, "high")],
         "최고난도 추론·심층 연구·복잡한 장기 작업": [
-            (premium, "xhigh"), (primary, "xhigh"), (runner_up, "xhigh")],
+            (premium, top.get(premium, "xhigh")),
+            (primary, top.get(primary, "xhigh")),
+            (runner_up, top.get(runner_up, "xhigh"))],
     })
 
 
@@ -66,22 +80,27 @@ def classify_tiers(primary: str, premium: str, budget: str, runner_up: str, micr
     })
 
 
-def strix_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=()):
+def strix_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=(), top=None):
     micro = list(micro)[:2] + [""] * (2 - len(list(micro)[:2]))
+    top = top or {}
     return _compact({
         "SIMPLE": [(budget, "medium"), (micro[0], "low"), (micro[1], "low")],
         "MEDIUM": [(primary, "medium")],
         "COMPLEX": [(primary, "high")],
-        "REASONING": [(primary, "xhigh")],
+        "REASONING": [(primary, top.get(primary, "xhigh"))],
     })
 
 
-def routers(primary: str, premium: str, budget: str, runner_up: str, micro=()):
-    """Map router name -> tier spec."""
+def routers(primary: str, premium: str, budget: str, runner_up: str, micro=(), top=None):
+    """Map router name -> tier spec.
+
+    ``top`` maps a model to its highest measured effort; the top tiers use it so
+    each fallback runs at its own ceiling instead of a shared label.
+    """
     return {
-        "auto": auto_tiers(primary, premium, budget, runner_up, micro),
+        "auto": auto_tiers(primary, premium, budget, runner_up, micro, top),
         "auto-classify": classify_tiers(primary, premium, budget, runner_up, micro),
-        "auto-strix": strix_tiers(primary, premium, budget, runner_up, micro),
+        "auto-strix": strix_tiers(primary, premium, budget, runner_up, micro, top),
     }
 
 

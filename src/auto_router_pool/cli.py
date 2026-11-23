@@ -28,19 +28,21 @@ from .apply import (
     smoke,
     validate,
 )
-from .client import Client, models, probe
+from .client import Client, deployment_health, models, probe
 from .pool import (
     MIN_INPUT_TOKENS,
     changed_scores,
     fingerprint,
+    flaky_deployments,
     group_state,
     input_window,
     pick,
     pick_primary,
     score,
     score_hashes,
+    stable_deployments,
 )
-from .tiers import ROUTERS, routers
+from .tiers import ROUTERS, routers, top_effort
 
 
 def default_home() -> Path:
@@ -129,6 +131,18 @@ def catalogue(rows: list[dict], prefix: str = "", suffixes=()) -> list[str]:
     return filtered(names, prefix, suffixes)
 
 
+def selected_models(rows: list[dict]) -> list[str]:
+    """Models the managed routers currently hand requests to."""
+    names: set[str] = set()
+    for row in rows:
+        if row["model_name"] not in ROUTERS:
+            continue
+        config = (row.get("litellm_params") or {}).get("complexity_router_config") or {}
+        for tier_names in (config.get("tiers") or {}).values():
+            names.update(tier_names)
+    return sorted(names)
+
+
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text()) if path.exists() else {}
 
@@ -155,6 +169,59 @@ def required_env(settings: "Settings") -> list[str]:
     return [name for name, value in (("LITELLM_MASTER_KEY", settings.key),) if not value]
 
 
+# A single health call can catch a deployment just after a token bucket refilled,
+# so flakiness is only reported when the same deployment both passes and 429s.
+DEPLOYMENT_SAMPLES = 3
+
+
+def triage_deployments(litellm, rows, name, *, apply=False):
+    """Disable only deployments that are intermittently rate-limiting.
+
+    Returns ``(blocked_ids, note)``. Blocking is skipped when the group has no
+    other deployment (the model itself would disappear) or when no sibling was
+    stable across every sample (the whole group is down, not one bad endpoint).
+    """
+    group = [
+        row
+        for row in rows
+        if row["model_name"] == name
+        and not (row.get("model_info") or {}).get("blocked")
+    ]
+    ids = []
+    for row in group:
+        model_id = (row.get("model_info") or {}).get("id")
+        if model_id:
+            ids.append(model_id)
+    if len(ids) < 2:
+        return [], "single_deployment"
+
+    samples = {
+        model_id: [
+            deployment_health(litellm, model_id) for _ in range(DEPLOYMENT_SAMPLES)
+        ]
+        for model_id in ids
+    }
+    flaky = flaky_deployments(samples)
+    if not flaky:
+        return [], "none_flaky"
+    if not stable_deployments(samples):
+        return [], "no_stable_sibling"
+    if not apply:
+        return flaky, "would_block"
+
+    blocked = []
+    for model_id in flaky:
+        result = litellm.post("/model/block", {"model_id": model_id})
+        if result.get("error_status") is not None:
+            continue
+        for row in rows:
+            info = row.get("model_info") or {}
+            if info.get("id") == model_id:
+                info["blocked"] = True
+        blocked.append(model_id)
+    return blocked, "blocked"
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes (default: preview)")
@@ -166,6 +233,10 @@ def parse_args(argv=None):
     parser.add_argument("--prefix", default="", help="only models whose id starts with this")
     parser.add_argument("--suffixes", default="", help="comma separated id suffixes, e.g. sol,astra")
     parser.add_argument("--micro", default=None, help="comma separated small models for light tiers")
+    parser.add_argument(
+        "--catalogue-proxy", action="store_true",
+        help="read candidate ids from CLIProxyAPI instead of LiteLLM's registered models",
+    )
     return parser.parse_args(argv)
 
 
@@ -193,7 +264,10 @@ def run(args) -> int:
     litellm = Client(settings.litellm_base, settings.key)
     rows = models(litellm)
 
-    if settings.cpkey:
+    # LiteLLM's registrations are the routing truth: a model the proxy lists but
+    # LiteLLM does not register can never serve a request. The proxy stays an
+    # explicit opt-in for setups that treat its /v1/models as authoritative.
+    if args.catalogue_proxy and settings.cpkey:
         cliproxy = Client(settings.cliproxy_base, settings.cpkey, timeout=30)
         names = discover(cliproxy, args.prefix, csv(args.suffixes))
         source = "cliproxy"
@@ -204,6 +278,7 @@ def run(args) -> int:
         print(json.dumps({"error": "no models discovered"}))
         return 1
     current_fp = fingerprint(rows, names)
+    quarantined: list[str] = []
 
     state_path = settings.home / "auto-pool-state.json"
     cache_path = settings.home / "auto-pool-aa-cache.json"
@@ -214,8 +289,25 @@ def run(args) -> int:
         and not context_drift(rows, ROUTERS)
         and not classifier_drift(rows, ROUTERS)
     ):
-        print(json.dumps({"skipped": "no catalogue change", "fingerprint": current_fp[:12]}))
-        return 0
+        # Cooldowns and recoveries never touch the catalogue, so a fingerprint
+        # match alone would keep a model that can no longer answer. Re-plan only
+        # when a selected model is actually unavailable.
+        unavailable = [
+            name for name in selected_models(rows) if not probe(litellm, name)[0]
+        ]
+        if unavailable and args.apply:
+            for name in unavailable:
+                blocked, _ = triage_deployments(litellm, rows, name, apply=True)
+                quarantined.extend(blocked)
+            if quarantined:
+                current_fp = fingerprint(rows, names)
+                unavailable = [
+                    name for name in selected_models(rows)
+                    if not probe(litellm, name)[0]
+                ]
+        if not unavailable and not quarantined:
+            print(json.dumps({"skipped": "no catalogue change", "fingerprint": current_fp[:12]}))
+            return 0
 
     cache = load_json(cache_path)
     previous_scores = state.get("scores", {})
@@ -229,6 +321,17 @@ def run(args) -> int:
             status[name] = reason
             continue
         ok, reason = probe(litellm, name)
+        if not ok:
+            blocked, note = triage_deployments(
+                litellm, rows, name, apply=args.apply
+            )
+            if blocked and args.apply:
+                quarantined.extend(blocked)
+                ok, reason = probe(litellm, name)
+            elif blocked:
+                reason = f"{reason};would_block={','.join(blocked)}"
+            elif note in ("single_deployment", "no_stable_sibling"):
+                reason = f"{reason};{note}"
         status[name] = reason
         if not ok:
             continue
@@ -246,6 +349,11 @@ def run(args) -> int:
             status[name] = "no_aa_entry"
         else:
             candidates[name] = variants
+
+    if quarantined and args.apply:
+        # The block flags are part of the fingerprint, so the state must record
+        # the catalogue as it stands after quarantine.
+        current_fp = fingerprint(rows, names)
 
     if structural:
         # Deliberately no state write: the watcher keeps retrying instead of
@@ -291,9 +399,10 @@ def run(args) -> int:
     for name in settings.micro:
         if name not in micro:
             status[name] = "context_below_floor"
+    top = {name: top_effort(variants) for name, variants in candidates.items()}
     changes = plan(
         rows,
-        routers(primary[0], premium[0], budget[0], runner_up, micro),
+        routers(primary[0], premium[0], budget[0], runner_up, micro, top),
         primary[0],
         runner_up,
     )
@@ -311,6 +420,7 @@ def run(args) -> int:
             "budget": round(budget[2], 1),
         },
         "score_updates": updates,
+        "quarantined": sorted(set(quarantined)),
         "status": status,
         "minimum_input_tokens": MIN_INPUT_TOKENS,
         "changed": len(changes),

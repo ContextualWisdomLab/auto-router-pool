@@ -62,6 +62,28 @@ def group_state(rows: list[dict], name: str, minimum: int = MIN_INPUT_TOKENS):
     return True, "registered"
 
 
+def flaky_deployments(samples: dict[str, list[str]]) -> list[str]:
+    """Deployments that both answered and rate-limited in the sample window.
+
+    A consistently failing deployment is not flaky: blocking it would remove a
+    deployment that is merely down, and it may recover without intervention.
+    """
+    return sorted(
+        model_id
+        for model_id, states in samples.items()
+        if "ok" in states and "rate_limited" in states
+    )
+
+
+def stable_deployments(samples: dict[str, list[str]]) -> set[str]:
+    """Deployments that answered every sample; only these can absorb traffic."""
+    return {
+        model_id
+        for model_id, states in samples.items()
+        if states and all(state == "ok" for state in states)
+    }
+
+
 def score(variants: dict, effort: str):
     """``(index, index per blended dollar, entry)`` for one effort."""
     entry = variants.get(effort) or variants.get("max")

@@ -20,10 +20,12 @@ the same model at `max`.
    separate catalogue proxy (CLIProxyAPI) is used only when `CPAPI_API_KEY` is
    set, which keeps `/v1/models` authoritative for setups that prefer it.
 2. **Filter to valid models**: a declared input window of at least 272,000
-   tokens, at least one unblocked deployment, and a one-token probe that is not
-   rejected with 400/403/404. `429` and `5xx` are treated as transient, so a
-   rate-limited model is never demoted. A model below the 272k floor is never a
-   candidate or a `--micro` entry.
+   tokens, at least one unblocked deployment, and a one-token probe answered by
+   the model itself. Any error (`400`/`429`/`5xx`/timeout) or an answer produced
+   by a fallback means the model cannot serve this run, so it is not a candidate.
+   Nothing is written to the catalogue, so the next run re-admits the model as
+   soon as it answers. A model below the 272k floor is never a candidate or a
+   `--micro` entry.
 3. **Fetch scores** from the Artificial Analysis model page, cached per slug.
 4. **Pick roles** under price caps:
 
@@ -59,19 +61,39 @@ Intelligence Index (2026-11), three variants of the same roster:
 | budget | 27.9 | 23.5 | 21.4 | 18.5 | 9.7 |
 
 The budget variant at `low` scores a third of what it does at `max`, so the light
-tiers run it at `medium`/`high`. The primary variant gains under a point from
-`xhigh` over `high`, so `xhigh` is reserved for the frontier tier.
+tiers run it at `medium`/`high`. The frontier tier runs every entry at its own
+measured peak, so its effort labels can differ: the primary variant gains under
+a point from `xhigh` over `high`, while the budget variant peaks at `max`
+(27.9 vs 23.5). Peak effort maximizes each model; it does not equalize them,
+and a cheaper fallback still scores lower than the frontier model.
+
+## Flaky deployments
+
+A model can be registered more than once (one deployment per credential or
+upstream route). When a probe fails, the run samples each unblocked deployment
+three times through `/health?model_id=`. A deployment that both answers and
+returns a 429 in that window is disabled with `/model/block`; the model is then
+probed again and stays eligible if a sibling can serve it. Blocking is skipped
+when the group has only one unblocked deployment, or when no sibling answered
+every sample: in those cases the outage is the model, not one bad route, and
+disabling the last deployment would remove the model entirely. Preview runs
+report `would_block` in the status instead of writing, and applied runs list the
+blocked ids under `quarantined`.
 
 ## Cadence
 
 `--watch` compares a fingerprint of the catalogue and blocked flags and exits
-immediately when nothing changed. A context floor that drifted from its own
-tiers also forces a run, so a cap change is never masked by an unchanged
-catalogue. That keeps a 15-minute cron cheap: no token spend, no score traffic
-unless something is actually out of date.
+when nothing changed. A context floor that drifted from its own tiers also
+forces a run, so a cap change is never masked by an unchanged catalogue. Before
+skipping, it probes only the models the routers currently select, because a
+cooldown or a recovery never changes the catalogue fingerprint: if a selected
+model cannot answer, the run re-plans against the models that can. That keeps a
+15-minute cron cheap: no score traffic unless something is actually out of date.
 
 ```cron
 */15 * * * * cd /path/to/auto-router-pool && PYTHONPATH=src /usr/bin/python3 -m auto_router_pool.cli --watch --apply >> "$HOME/.local/state/auto-router-pool/refresh.log" 2>&1
+# Safety net: a full re-score and re-plan even when the catalogue is unchanged.
+3 4,12,20 * * * cd /path/to/auto-router-pool && PYTHONPATH=src /usr/bin/python3 -m auto_router_pool.cli --refresh-scores --apply >> "$HOME/.local/state/auto-router-pool/refresh.log" 2>&1
 ```
 
 Scores are cached for 7 days (`AA_TTL`) because a released model's index barely
@@ -101,6 +123,8 @@ closed when nothing qualifies.
 | cached model, page now broken | last known numbers used until the cache expires |
 | `LITELLM_MASTER_KEY` missing | `{"error": "missing environment"}`, exit 1 |
 | another run holds the lock | `{"skipped": "locked"}`, exit 0 |
+| probe errors (`429`/`5xx`/timeout) or a fallback answers | `unavailable_*` / `fallback_*`, model is not a candidate for that run |
+| a selected model is unavailable while the catalogue is unchanged | `--watch` re-plans instead of skipping |
 | server rejects a tier config | `{"result": "rejected"}`, exit 1, nothing written |
 | patch does not persist | all routers restored from the backup |
 
@@ -121,7 +145,7 @@ Requires Python 3.10+. No third-party runtime dependencies.
 | variable | default | meaning |
 |---|---|---|
 | `LITELLM_MASTER_KEY` | — | LiteLLM admin key (required) |
-| `CPAPI_API_KEY` | — | optional catalogue proxy key; unset means LiteLLM is the catalogue |
+| `CPAPI_API_KEY` | — | optional catalogue proxy key, used only with `--catalogue-proxy` |
 | `LITELLM_BASE` | `http://127.0.0.1:4000` | LiteLLM base URL |
 | `CLIPROXY_BASE` | `http://127.0.0.1:8317` | catalogue proxy base URL, used only with `CPAPI_API_KEY` |
 | `AA_BASE` | `https://artificialanalysis.ai/models/` | score source, override for tests |
@@ -130,12 +154,14 @@ Requires Python 3.10+. No third-party runtime dependencies.
 | `AUTO_POOL_ENV_FILE` | — | file with `KEY=VALUE` secrets |
 
 Flags: `--apply`, `--watch`, `--refresh-scores`, `--smoke`, `--prefix`,
-`--suffixes`, `--micro`, `--home`, `--env-file`.
+`--suffixes`, `--micro`, `--catalogue-proxy`, `--home`, `--env-file`.
 
-The catalogue proxy is a convenience, not a dependency: `CPAPI_API_KEY` unset
-means candidate ids are read from LiteLLM's `/model/info`, where the managed
-routers and `__`-prefixed advisory groups are skipped either way. The run report
-names the source in `catalogue` (`litellm` or `cliproxy`).
+Candidate ids come from LiteLLM's `/model/info`, which is the routing truth: a
+model the proxy lists but LiteLLM does not register cannot serve a request. The
+managed routers and `__`-prefixed advisory groups are skipped either way. The
+catalogue proxy is an explicit opt-in for setups where its `/v1/models` is
+authoritative; the run report names the source in `catalogue` (`litellm` or
+`cliproxy`).
 
 Nothing about a particular deployment is hardcoded: model families, the small
 models used for light tiers, and every path are supplied by the caller. The

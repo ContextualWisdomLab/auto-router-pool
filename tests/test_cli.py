@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from auto_router_pool import cli
+from auto_router_pool import cli, client
 
 
 class FakeClient:
@@ -97,6 +97,146 @@ class SettingsTest(unittest.TestCase):
         settings = cli.Settings(key="sk-litellm")
         self.assertEqual(cli.required_env(settings), [])
         self.assertEqual(cli.required_env(cli.Settings(key="")), ["LITELLM_MASTER_KEY"])
+
+
+class SelectedModelsTest(unittest.TestCase):
+    def test_collects_models_from_every_managed_router(self):
+        rows = [
+            {"model_name": "auto", "model_info": {},
+             "litellm_params": {"complexity_router_config": {
+                 "tiers": {"SIMPLE": ["budget"], "COMPLEX": ["primary", "premium"]}}}},
+            {"model_name": "auto-strix", "model_info": {},
+             "litellm_params": {"complexity_router_config": {
+                 "tiers": {"MEDIUM": ["primary"]}}}},
+            info_row("plain-model"),
+        ]
+        self.assertEqual(cli.selected_models(rows), ["budget", "premium", "primary"])
+
+
+class StubClient:
+    def __init__(self, result):
+        self.result = result
+
+    def post(self, *args, **kwargs):
+        return self.result
+
+
+class ProbeTest(unittest.TestCase):
+    def test_cooldown_is_unavailable(self):
+        self.assertEqual(client.probe(StubClient({"error_status": 429}), "gpt-6.2-sol"),
+                         (False, "unavailable_429"))
+
+    def test_rejected_model_is_unavailable(self):
+        self.assertEqual(client.probe(StubClient({"error_status": 400}), "m"),
+                         (False, "unavailable_400"))
+
+    def test_fallback_answer_is_not_availability(self):
+        self.assertEqual(
+            client.probe(StubClient({"model": "gemini-3.8-flash"}), "gpt-6.1-sol"),
+            (False, "fallback_gemini-3.8-flash"),
+        )
+
+    def test_model_answering_itself_is_ok(self):
+        self.assertEqual(client.probe(StubClient({"model": "grok-4.7"}), "grok-4.7"),
+                         (True, "ok"))
+
+    def test_timeout_is_a_status_not_a_crash(self):
+        with mock.patch("urllib.request.urlopen", side_effect=TimeoutError()):
+            result = client.Client("http://127.0.0.1:4000", "k").get("/model/info")
+        self.assertEqual(result["error_status"], "unreachable")
+
+
+class DeploymentClient:
+    def __init__(self, health_states, block_result=None):
+        self.health_states = {key: list(value) for key, value in health_states.items()}
+        self.block_result = block_result or {"blocked": True}
+        self.blocks = []
+        self.calls = {}
+
+    def get(self, path, timeout=None):
+        model_id = path.split("model_id=", 1)[1]
+        index = self.calls.get(model_id, 0)
+        self.calls[model_id] = index + 1
+        state = self.health_states[model_id][index]
+        if state == "rate_limited":
+            # LiteLLM scopes by ?model_id= and leaves the field out of endpoints.
+            return {"error_status": 429, "error_body": {"unhealthy_endpoints": [
+                {"error": "429 rate limit exceeded"}
+            ]}}
+        if state == "ok":
+            return {"healthy_endpoints": [{"model_id": model_id}]}
+        if state == "unhealthy":
+            return {"healthy_endpoints": [], "unhealthy_endpoints": [
+                {"error": "503 high demand"}
+            ]}
+        return {"error_status": 500}
+
+    def post(self, path, body, timeout=None):
+        self.blocks.append((path, body))
+        return self.block_result
+
+
+def deployment_row(name, model_id, blocked=False):
+    return {"model_name": name, "model_info": {"id": model_id, "blocked": blocked}}
+
+
+class DeploymentHealthTest(unittest.TestCase):
+    def test_health_report_in_a_429_body_is_read(self):
+        client_ = DeploymentClient({"m": ["rate_limited"]})
+        self.assertEqual(client.deployment_health(client_, "m"), "rate_limited")
+
+    def test_healthy_endpoint_is_ok(self):
+        client_ = DeploymentClient({"m": ["ok"]})
+        self.assertEqual(client.deployment_health(client_, "m"), "ok")
+
+    def test_plain_429_without_a_report_is_rate_limited(self):
+        class Plain:
+            def get(self, path, timeout=None):
+                return {"error_status": 429}
+        self.assertEqual(client.deployment_health(Plain(), "m"), "rate_limited")
+
+    def test_non_429_endpoint_error_is_not_flakiness(self):
+        client_ = DeploymentClient({"m": ["unhealthy"]})
+        self.assertEqual(client.deployment_health(client_, "m"), "unhealthy")
+
+
+class TriageTest(unittest.TestCase):
+    def test_blocks_only_the_intermittent_deployment(self):
+        rows = [deployment_row("m", "a"), deployment_row("m", "b")]
+        client_ = DeploymentClient({"a": ["ok", "rate_limited", "ok"],
+                                    "b": ["ok", "ok", "ok"]})
+        blocked, note = cli.triage_deployments(client_, rows, "m", apply=True)
+        self.assertEqual(blocked, ["a"])
+        self.assertEqual(note, "blocked")
+        self.assertTrue(rows[0]["model_info"]["blocked"])
+        self.assertFalse(rows[1]["model_info"]["blocked"])
+        self.assertEqual(client_.blocks, [("/model/block", {"model_id": "a"})])
+
+    def test_preview_reports_without_writing(self):
+        rows = [deployment_row("m", "a"), deployment_row("m", "b")]
+        client_ = DeploymentClient({"a": ["ok", "rate_limited", "ok"],
+                                    "b": ["ok", "ok", "ok"]})
+        blocked, note = cli.triage_deployments(client_, rows, "m", apply=False)
+        self.assertEqual((blocked, note), (["a"], "would_block"))
+        self.assertEqual(client_.blocks, [])
+        self.assertFalse(rows[0]["model_info"]["blocked"])
+
+    def test_single_deployment_is_never_blocked(self):
+        rows = [deployment_row("m", "a")]
+        client_ = DeploymentClient({"a": ["ok", "rate_limited", "ok"]})
+        self.assertEqual(cli.triage_deployments(client_, rows, "m", apply=True),
+                         ([], "single_deployment"))
+        self.assertEqual(client_.blocks, [])
+
+    def test_no_stable_sibling_means_a_group_outage_not_a_bad_deployment(self):
+        rows = [deployment_row("m", "a"), deployment_row("m", "b")]
+        client_ = DeploymentClient({"a": ["ok", "rate_limited", "ok"],
+                                    "b": ["ok", "rate_limited", "ok"]})
+        self.assertEqual(
+            cli.triage_deployments(client_, rows, "m", apply=True),
+            ([], "no_stable_sibling"),
+        )
+        self.assertEqual(client_.blocks, [])
 
 
 if __name__ == "__main__":

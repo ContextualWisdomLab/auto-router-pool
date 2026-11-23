@@ -28,6 +28,24 @@ class ScoreTest(unittest.TestCase):
         self.assertIsNone(pool.score({}, "high"))
 
 
+class DeploymentFlakinessTest(unittest.TestCase):
+    def test_only_mixed_samples_are_flaky(self):
+        samples = {
+            "mixed": ["ok", "rate_limited", "ok"],
+            "down": ["rate_limited", "rate_limited", "rate_limited"],
+            "healthy": ["ok", "ok", "ok"],
+        }
+        self.assertEqual(pool.flaky_deployments(samples), ["mixed"])
+
+    def test_stable_requires_every_sample_to_answer(self):
+        samples = {
+            "mixed": ["ok", "rate_limited", "ok"],
+            "healthy": ["ok", "ok", "ok"],
+            "unknown": ["unknown", "unknown", "unknown"],
+        }
+        self.assertEqual(pool.stable_deployments(samples), {"healthy"})
+
+
 class PickTest(unittest.TestCase):
     def test_primary_prefers_non_astra_within_quality_tolerance(self):
         candidates = {
