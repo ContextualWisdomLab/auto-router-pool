@@ -27,7 +27,7 @@ class RoutersTest(unittest.TestCase):
                 self.assertEqual(len(names), len(set(names)), tier)
 
     def test_efforts_are_known(self):
-        allowed = {"low", "medium", "high", "xhigh"}
+        allowed = {"low", "medium", "high", "xhigh", "max"}
         for tier_map in self.routers.values():
             for entries in tier_map.values():
                 for _, effort in entries:
@@ -40,6 +40,33 @@ class RoutersTest(unittest.TestCase):
     def test_light_tier_does_not_use_low_effort_for_budget(self):
         simple = self.routers["auto"]["명시 정보 추출·단순 분류·고정 규칙 처리"]
         self.assertEqual(simple[0], ("budget", "medium"))
+
+    def test_top_tier_uses_each_models_peak_effort(self):
+        routers = tiers.routers(
+            "primary", "premium", "budget", "runner-up", (),
+            {"premium": "xhigh", "primary": "max", "runner-up": "max"},
+        )
+        frontier = routers["auto"]["최고난도 추론·심층 연구·복잡한 장기 작업"]
+        self.assertEqual(
+            frontier,
+            [("premium", "xhigh"), ("primary", "max"), ("runner-up", "max")],
+        )
+        self.assertEqual(routers["auto-strix"]["REASONING"], [("primary", "max")])
+
+
+class TopEffortTest(unittest.TestCase):
+    def test_picks_highest_measured_index(self):
+        self.assertEqual(
+            tiers.top_effort({"xhigh": {"index": 50.0}, "max": {"index": 49.2}}),
+            "xhigh",
+        )
+        self.assertEqual(
+            tiers.top_effort({"xhigh": {"index": 23.5}, "max": {"index": 27.9}}),
+            "max",
+        )
+
+    def test_empty_ladder_falls_back_to_xhigh(self):
+        self.assertEqual(tiers.top_effort({}), "xhigh")
 
 
 class BuildTest(unittest.TestCase):

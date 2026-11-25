@@ -151,5 +151,37 @@ class ApplyTest(unittest.TestCase):
         )
 
 
+class FallbackClient:
+    def __init__(self, result):
+        self.result = result
+        self.posts = []
+
+    def get(self, path):
+        return self.result
+
+    def post(self, path, body):
+        self.posts.append((path, body))
+        return {"ok": True}
+
+
+class AutoFallbackTest(unittest.TestCase):
+    def test_replaces_only_the_auto_edge(self):
+        client = FallbackClient({"current_values": {"fallbacks": [
+            {"auto": ["old"]}, {"other": ["keep"]}
+        ]}})
+        apply.set_auto_fallback(client, ["premium", "primary"])
+        self.assertEqual(client.posts, [("/config/update", {
+            "router_settings": {"fallbacks": [
+                {"auto": ["premium", "primary"]}, {"other": ["keep"]}
+            ]}
+        })])
+
+    def test_settings_error_leaves_fallbacks_untouched(self):
+        client = FallbackClient({"error_status": "unreachable"})
+        with self.assertRaises(RuntimeError):
+            apply.set_auto_fallback(client, ["premium"])
+        self.assertEqual(client.posts, [])
+
+
 if __name__ == "__main__":
     unittest.main()
