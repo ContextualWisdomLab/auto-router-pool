@@ -230,7 +230,9 @@ def set_auto_fallback(client, chain: list[str]):
         edges[source] = list(targets)
     edges["auto"] = list(chain)
     fallbacks = [{src: targets} for src, targets in sorted(edges.items()) if targets]
-    client.post("/config/update", {"router_settings": {"fallbacks": fallbacks}})
+    result = client.post("/config/update", {"router_settings": {"fallbacks": fallbacks}})
+    if result.get("error_status") is not None:
+        raise RuntimeError(f"fallback update failed ({result['error_status']})")
 
 
 def smoke(client) -> dict:

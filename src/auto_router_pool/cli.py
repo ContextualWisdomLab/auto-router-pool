@@ -221,17 +221,19 @@ def triage_deployments(litellm, rows, name, *, apply=False):
     return blocked, "blocked"
 
 
-def usable_micro(litellm, rows, candidates, requested):
+def usable_micro(litellm, rows, candidates, requested, *, probe_failures=None):
     """Micro models that can serve this run.
 
-    A candidate already passed this run's probe. A requested model outside the
-    candidate set is checked against registration and blocked flags, then probed
-    once, so a rate-limited micro model is not written back into a light tier
-    just because its declared window is large.
+    Reuse failed candidate probes and skip probing scored candidates again.
+    Other requested models are checked against registration and blocked flags,
+    then probed to see whether they can serve a light tier.
     """
     chosen = []
     reasons = {}
     for name in requested:
+        if probe_failures and name in probe_failures:
+            reasons[name] = probe_failures[name]
+            continue
         usable, reason = group_state(rows, name)
         if not usable:
             reasons[name] = reason
@@ -306,9 +308,12 @@ def run(args) -> int:
 
     state_path = settings.home / "auto-pool-state.json"
     cache_path = settings.home / "auto-pool-aa-cache.json"
+    pending_path = settings.home / "auto-pool-fallback-pending"
+    fallback_pending = pending_path.exists()
     state = load_json(state_path)
     if (
         args.watch
+        and not fallback_pending
         and state.get("fingerprint") == current_fp
         and not context_drift(rows, ROUTERS)
         and not classifier_drift(rows, ROUTERS)
@@ -337,6 +342,7 @@ def run(args) -> int:
     previous_scores = state.get("scores", {})
 
     status: dict[str, str] = {}
+    probe_failures: dict[str, str] = {}
     candidates: dict[str, dict] = {}
     structural: list[str] = []
     for name in names:
@@ -358,6 +364,7 @@ def run(args) -> int:
                 reason = f"{reason};{note}"
         status[name] = reason
         if not ok:
+            probe_failures[name] = reason
             continue
         variants, error = aa.get_variants(
             name.replace(".", "-"),
@@ -419,7 +426,9 @@ def run(args) -> int:
 
     # A micro model that cannot serve this run is dropped from the light tiers
     # instead of being written back because its declared window is large enough.
-    micro, micro_status = usable_micro(litellm, rows, candidates, settings.micro)
+    micro, micro_status = usable_micro(
+        litellm, rows, candidates, settings.micro, probe_failures=probe_failures
+    )
     status.update(micro_status)
     top = {name: top_effort(variants) for name, variants in candidates.items()}
     changes = plan(
@@ -453,31 +462,32 @@ def run(args) -> int:
         },
     }
 
-    if not changes:
-        save_state(state_path, current_fp, hashes)
+    if not changes and not (args.apply and fallback_pending):
+        if not fallback_pending:
+            save_state(state_path, current_fp, hashes)
         print(json.dumps({**summary, "result": "unchanged"}, ensure_ascii=False))
         return 0
 
+    output = {**summary, "result": "applied"}
     try:
-        validate(litellm, changes)
-        backup_path = backup(changes, settings.home)
-        if not args.apply:
-            print(
-                json.dumps(
-                    {**summary, "result": "preview", "backup": str(backup_path)},
-                    ensure_ascii=False,
-                )
-            )
-            return 0
+        if changes:
+            validate(litellm, changes)
+            output["backup"] = str(backup(changes, settings.home))
+            if not args.apply:
+                print(json.dumps({**output, "result": "preview"}, ensure_ascii=False))
+                return 0
 
-        apply_changes(litellm, changes)
+            # Model writes may persist without the fallback update. Mark the
+            # refresh pending before patching so watch cannot skip recovery.
+            pending_path.touch()
+            apply_changes(litellm, changes)
         set_auto_fallback(litellm, [premium[0], primary[0], runner_up, budget[0]])
     except (ValueError, RuntimeError) as error:
         print(json.dumps({**summary, "result": "rejected", "error": str(error)}))
         return 1
 
     save_state(state_path, current_fp, hashes)
-    output = {**summary, "result": "applied", "backup": str(backup_path)}
+    pending_path.unlink()
     if args.smoke:
         output["smoke"] = smoke(litellm)
     print(json.dumps(output, ensure_ascii=False))

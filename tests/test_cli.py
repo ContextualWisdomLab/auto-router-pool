@@ -1,6 +1,11 @@
+import io
+import json
 import os
 import unittest
+from collections import Counter
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 from auto_router_pool import cli, client
@@ -265,6 +270,119 @@ class TriageTest(unittest.TestCase):
             ([], "no_stable_sibling"),
         )
         self.assertEqual(client_.blocks, [])
+
+
+class RefreshTest(unittest.TestCase):
+    def setUp(self):
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
+        self.home = Path(contexts.enter_context(TemporaryDirectory()))
+        self.rows = [
+            {"model_name": name, "model_info": {"id": name, "max_input_tokens": 400000}}
+            for name in ("pool-primary", "pool-budget")
+        ]
+        self.router = {
+            "model_name": "auto",
+            "model_info": {"id": "auto", "max_input_tokens": 400000},
+            "litellm_params": {"complexity_router_config": {"tiers": {}}},
+        }
+        self.rows.append(self.router)
+        self.fallbacks = [{"auto": ["old"]}, {"other": ["keep"]}]
+        self.fallback_error_at = None
+        self.probes = Counter()
+        self.patch_count = 0
+        self.state_path = self.home / "auto-pool-state.json"
+        contexts.enter_context(mock.patch.object(cli.Settings, "from_env",
+                                          return_value=cli.Settings(home=self.home, key="test")))
+        contexts.enter_context(mock.patch.object(cli, "Client", return_value=self))
+        contexts.enter_context(mock.patch.object(cli.aa, "get_variants", side_effect=self.variants))
+
+    def variants(self, name, *args, **kwargs):
+        entry = {"index": 60, "in": 1, "out": 3} if name == "pool-primary" else {
+            "index": 30, "in": 0.1, "out": 0.2,
+        }
+        return {"max": entry}, None
+
+    def get(self, path):
+        if path == self.fallback_error_at:
+            return {"error_status": 503}
+        if path == "/model/info":
+            return {"data": self.rows}
+        if path == "/router/settings":
+            return {"current_values": {"fallbacks": self.fallbacks}}
+        raise AssertionError(path)
+
+    def post(self, path, body, timeout=None):
+        if path == "/v1/chat/completions":
+            name = body["model"]
+            self.probes[name] += 1
+            if name in ("pool-failed", "pool-recovered") and self.probes[name] == 1:
+                return {"error_status": 429}
+            return {"model": name}
+        if path == "/auto_router/validate_complexity_router_config":
+            return {"valid": True}
+        if path == "/config/update":
+            if path == self.fallback_error_at:
+                return {"error_status": 503}
+            self.fallbacks = body["router_settings"]["fallbacks"]
+            return {"ok": True}
+        raise AssertionError(path)
+
+    def patch(self, path, body):
+        self.assertEqual(path, "/model/auto/update")
+        self.router.update(body)
+        self.patch_count += 1
+
+    def refresh(self, *flags):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = cli.run(cli.parse_args(["--prefix", "pool-", *flags]))
+        return result, json.loads(out.getvalue())
+
+    def test_watch_retries_failed_fallback_without_repatching_routers(self):
+        cli.save_state(self.state_path, cli.fingerprint(self.rows, cli.catalogue(self.rows)), {})
+        original_state = self.state_path.read_text()
+        for path, flags in (("/router/settings", ()), ("/config/update", ("--watch",))):
+            with self.subTest(path=path):
+                self.fallback_error_at = path
+                code, output = self.refresh("--apply", *flags)
+                self.assertEqual((code, output["result"]), (1, "rejected"))
+                self.assertEqual(self.patch_count, 1)
+                self.assertEqual(self.fallbacks[0], {"auto": ["old"]})
+                self.assertEqual(self.state_path.read_text(), original_state)
+        self.assertEqual(self.refresh("--watch")[1]["result"], "unchanged")
+        self.assertEqual(self.state_path.read_text(), original_state)
+
+        self.fallback_error_at = None
+        code, output = self.refresh("--apply", "--watch")
+        self.assertEqual((code, output["result"], output["changed"]), (0, "applied", 0))
+        self.assertEqual(self.patch_count, 1)
+        self.assertEqual(self.fallbacks, [
+            {"auto": ["pool-primary", "pool-primary", "pool-budget", "pool-budget"]},
+            {"other": ["keep"]},
+        ])
+        self.assertEqual(self.refresh("--apply", "--watch")[1]["skipped"], "no catalogue change")
+
+    def test_micro_reuses_candidate_failure_and_keeps_recovered_and_standalone_models(self):
+        for name in ("pool-failed", "pool-recovered", "standalone"):
+            self.rows.append({"model_name": name, "model_info": {"max_input_tokens": 400000}})
+
+        with mock.patch.object(cli, "triage_deployments",
+                               side_effect=lambda _, rows, name, **kw: (
+                                   (["flaky"], "blocked") if name == "pool-recovered"
+                                   else ([], "single_deployment")
+                               )):
+            code, output = self.refresh("--apply", "--micro", "pool-failed,pool-recovered,standalone")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"]["pool-failed"], "unavailable_429;single_deployment")
+        self.assertEqual(self.probes["pool-failed"], 1)
+        self.assertEqual(self.probes["pool-recovered"], 2)
+        self.assertEqual(self.probes["standalone"], 1)
+        selected = cli.selected_models(self.rows)
+        self.assertNotIn("pool-failed", selected)
+        self.assertIn("pool-recovered", selected)
+        self.assertIn("standalone", selected)
 
 
 if __name__ == "__main__":
