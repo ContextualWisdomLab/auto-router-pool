@@ -358,7 +358,7 @@ class RefreshTest(unittest.TestCase):
         self.assertEqual((code, output["result"], output["changed"]), (0, "applied", 0))
         self.assertEqual(self.patch_count, 1)
         self.assertEqual(self.fallbacks, [
-            {"auto": ["pool-primary", "pool-primary", "pool-budget", "pool-budget"]},
+            {"auto": ["pool-primary", "pool-budget"]},
             {"other": ["keep"]},
         ])
         self.assertEqual(self.refresh("--apply", "--watch")[1]["skipped"], "no catalogue change")
