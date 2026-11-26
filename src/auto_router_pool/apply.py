@@ -228,7 +228,9 @@ def set_auto_fallback(client, chain: list[str]):
     for entry in settings.get("fallbacks") or []:
         source, targets = next(iter(entry.items()))
         edges[source] = list(targets)
-    edges["auto"] = list(chain)
+    # One model can win several roles at once (premium, primary, budget). A
+    # repeated hop only retries the same deployment, so keep the first mention.
+    edges["auto"] = list(dict.fromkeys(name for name in chain if name))
     fallbacks = [{src: targets} for src, targets in sorted(edges.items()) if targets]
     result = client.post("/config/update", {"router_settings": {"fallbacks": fallbacks}})
     if result.get("error_status") is not None:

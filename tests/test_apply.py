@@ -176,6 +176,15 @@ class AutoFallbackTest(unittest.TestCase):
             ]}
         })])
 
+    def test_repeated_roles_collapse_to_first_mention(self):
+        client = FallbackClient({"current_values": {"fallbacks": []}})
+        apply.set_auto_fallback(
+            client, ["luna", "luna", "lightning", "luna", None]
+        )
+        self.assertEqual(client.posts, [("/config/update", {
+            "router_settings": {"fallbacks": [{"auto": ["luna", "lightning"]}]}
+        })])
+
     def test_settings_error_leaves_fallbacks_untouched(self):
         client = FallbackClient({"error_status": "unreachable"})
         with self.assertRaises(RuntimeError):
