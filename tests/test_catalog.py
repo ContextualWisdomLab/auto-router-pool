@@ -202,6 +202,43 @@ class PlanTest(unittest.TestCase):
             catalog.plan({"m"}, {"m": entry("m")}, rows)
 
 
+class BatchTest(unittest.TestCase):
+    def test_a_batch_named_model_is_registered_as_batch(self):
+        batch = entry(
+            "gpt-5.4-batch", maker="OpenAI",
+            routes=(("openai", True),),
+        )
+        batch["providers"][0]["provider_model_id"] = "gpt-5.4:batch"
+        _, body = by_name(
+            catalog.plan({"gpt-5.4-batch"}, {"gpt-5.4-batch": batch}, []),
+            "gpt-5.4-batch",
+        )
+        self.assertEqual(body["litellm_params"]["model"], "openai/gpt-5.4")
+        self.assertEqual(body["model_info"]["mode"], "batch")
+        self.assertEqual(body["model_info"]["supported_endpoints"], ["/v1/batches"])
+
+    def test_a_chat_model_with_a_batch_endpoint_stays_chat(self):
+        chat = entry("m", supported_endpoints=["/v1/chat/completions", "/v1/batch"])
+        _, body = by_name(catalog.plan({"m"}, {"m": chat}, []), "m")
+        self.assertEqual(body["model_info"]["mode"], "chat")
+        self.assertNotIn("supported_endpoints", body["model_info"])
+
+    def test_batch_catalog_separates_authenticated_from_advertised(self):
+        public = {
+            "reachable-batch": entry("reachable-batch"),
+            "advertised-batch": entry("advertised-batch"),
+            "chat": entry("chat"),
+        }
+        summary = catalog.batch_catalog(
+            {"reachable-batch"}, public,
+            {"openrouter/x:batch": {"mode": "chat"}, "openrouter/x": {}},
+        )
+        self.assertEqual(summary["found"], 2)
+        self.assertEqual(summary["authenticated"], 1)
+        self.assertEqual(summary["models"], ["reachable-batch"])
+        self.assertEqual(summary["price_map"], 1)
+
+
 class DropTest(unittest.TestCase):
     def test_gemini_gets_the_drop_param(self):
         params = catalog.prompt_cache_drop({"model": "openai/gemini-4-neon"})

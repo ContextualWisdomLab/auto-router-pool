@@ -25,7 +25,14 @@ the same model at `max`.
    `experiential_cloud`, so a new model appears without a separate cron. A model
    the catalogue describes as a decision model (`/v1/systemone`) is registered on
    the native SystemOne transport instead of the OpenAI chat one, which would
-   send `/v1/decisions` and be refused. This stage never writes block flags:
+   send `/v1/decisions` and be refused. A **batch** entry (`-batch` name,
+   `:batch` route or a `/v1/batches` endpoint) is registered with
+   `model_info.mode: batch`, and the `:batch` price-map suffix is stripped from
+   the model id because the provider's batch API takes the normal slug. A model
+   that advertises chat as well as batches stays a chat model. The run reports
+   how many batch entries the catalogue advertises, how many this account can
+   actually call, and how many `:batch` prices exist; only an authenticated entry
+   is registered. This stage never writes block flags:
    `--quarantine` owns those, because a probe can prove a deployment dead but an
    account's exhausted credit is not provable from one deployment.
 2. **Filter to valid models**: a declared input window of at least 272,000

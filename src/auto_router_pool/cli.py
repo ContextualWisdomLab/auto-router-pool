@@ -52,6 +52,7 @@ from .pool import (
     pick_micro,
     score_hashes,
     stable_deployments,
+    batch_models,
     classifier_candidates,
     decision_candidates,
     decision_catalog,
@@ -731,6 +732,8 @@ def run(args) -> int:
         "free_gaps": free_gaps(rows, candidates),
         # Decision models answer a schema, not a chat turn: never tier members.
         "decision_models": decision_models(rows),
+        # Batch models are registered for /v1/batches and never chat tiers.
+        "batch_models": batch_models(rows),
         "guests": guest_results,
         "catalog_sync": catalog_sync,
         "default_model": {"model": default, **default_note},

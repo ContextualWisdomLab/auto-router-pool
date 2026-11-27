@@ -145,6 +145,32 @@ def decisions_endpoint(entry: dict) -> str | None:
     return None
 
 
+BATCH_ENDPOINT = "/v1/batches"
+
+
+def batch_endpoint(entry: dict) -> str | None:
+    """The batch route for a catalogue entry, or ``None`` when it is not batch-only.
+
+    LiteLLM marks a batch deployment with ``model_info.mode: batch`` so it is
+    not offered as an interactive chat model. The upstream catalogue has no
+    shared mode field, so the batch endpoint or the conventional ``-batch`` /
+    ``:batch`` name is the claim. A model that also advertises chat is a chat
+    model with batch support, not a batch-only deployment.
+    """
+    model = entry.get("model") or {}
+    endpoints = [str(item).lower() for item in (model.get("supported_endpoints") or [])]
+    if any("chat/completions" in item for item in endpoints):
+        return None
+    if any(item.endswith("/batches") or item.endswith("/batch") for item in endpoints):
+        return BATCH_ENDPOINT
+    provider_id = str((route(entry) or {}).get("provider_model_id") or "").lower()
+    slug = str(model.get("slug") or "").lower()
+    display = str(model.get("display_name") or "").lower()
+    if slug.endswith("-batch") or "(batch)" in display or provider_id.endswith(":batch"):
+        return BATCH_ENDPOINT
+    return None
+
+
 def is_decisions_model(entry: dict) -> bool:
     """Whether the catalogue describes a decision-only model.
 
@@ -276,7 +302,21 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
 
         publisher, transport = resolve_publisher(slug, model, provider_route, prices)
         endpoint = decisions_endpoint(entry)
-        if endpoint == "/v1/systemone":
+        batch = batch_endpoint(entry)
+        if batch:
+            # A batch variant is often named after the group (``gpt-5.4-batch``)
+            # while the provider route carries the model the batch actually
+            # runs (``gpt-5.4``). Calling the group name would ask the provider
+            # for a model that does not exist.
+            provider_id = str(provider_route.get("provider_model_id") or "").lstrip("~")
+            # A batch price-map key often carries ``:batch``; the provider's
+            # batch API takes the normal slug, so it is not part of the model id.
+            provider_id = provider_id.removesuffix(":batch")
+            params = {
+                "model": transport + "/" + (provider_id or slug),
+                "custom_llm_provider": transport,
+            }
+        elif endpoint == "/v1/systemone":
             params = {
                 "model": "hosted_vllm/" + slug,
                 "custom_llm_provider": "hosted_vllm",
@@ -293,7 +333,7 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
                 "model": transport + "/" + slug,
                 "custom_llm_provider": transport,
             }
-        endpoints = [endpoint] if endpoint else None
+        endpoints = [batch] if batch else ([endpoint] if endpoint else None)
         params.update({
             "api_base": API if transport == "anthropic" else API + "/v1",
             "litellm_credential_name": CREDENTIAL,
@@ -310,7 +350,7 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
         params = prompt_cache_drop(params)
 
         info = {
-            "mode": "decisions" if endpoint else "chat",
+            "mode": "batch" if batch else ("decisions" if endpoint else "chat"),
             **(({"is_free": True}) if free else {}),
             OWNER: OWNER,
             "catalog_slug": slug,
@@ -373,6 +413,29 @@ def apply_plan(client, planned) -> list[dict]:
     return results
 
 
+def batch_catalog(auth_ids, public: dict, prices: dict | None = None) -> dict:
+    """Batch models the catalogue advertises, split by whether this account can call them.
+
+    Batch entries are commonly listed publicly before a key is granted access.
+    Reporting both numbers keeps "no batch model registered" distinguishable
+    from "this catalogue has no batch model at all".
+    """
+    auth = set(auth_ids or ())
+    found = {
+        slug for slug, entry in (public or {}).items()
+        if batch_endpoint(entry)
+    }
+    authenticated = sorted(found & auth)
+    return {
+        "found": len(found),
+        "authenticated": len(authenticated),
+        "models": authenticated,
+        "price_map": sum(
+            1 for key in (prices or {}) if str(key).lower().endswith(":batch")
+        ),
+    }
+
+
 def sync(client, rows: list[dict], home: Path, *, prices: dict | None = None,
          key: str | None = None, api: str = API, apply: bool = False) -> dict:
     """Fetch, plan and (when asked) register missing catalogue models.
@@ -397,6 +460,7 @@ def sync(client, rows: list[dict], home: Path, *, prices: dict | None = None,
     summary = {
         "source": "experientiallabs",
         "models": len(auth_ids),
+        "batch": batch_catalog(auth_ids, public, prices),
         "eligible": len(planned),
         "create": sum(action == "create" for action, _ in planned),
         "update": sum(action == "update" for action, _ in planned),

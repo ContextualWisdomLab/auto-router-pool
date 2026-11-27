@@ -57,6 +57,9 @@ def group_state(rows: list[dict], name: str, minimum: int = MIN_INPUT_TOKENS):
     group = [row for row in rows if row["model_name"] == name]
     if not group:
         return False, "unregistered"
+    mode = str((group[0].get("model_info") or {}).get("mode") or "").lower()
+    if mode == "batch":
+        return False, "batch_model"
     if all((row.get("model_info") or {}).get("blocked") for row in group):
         return False, "all_blocked"
     if input_window(rows, name) < minimum:
@@ -328,6 +331,17 @@ def specialized_models(rows: list[dict], catalog: dict | None = None,
 
         found[kind] = sorted(names, key=rank)
     return found
+
+
+def batch_models(rows: list[dict]) -> list[str]:
+    """Registered groups that serve the batch API rather than a chat turn."""
+    return sorted(
+        name for name in {row["model_name"] for row in rows}
+        if any(
+            str((row.get("model_info") or {}).get("mode") or "").lower() == "batch"
+            for row in rows if row["model_name"] == name
+        )
+    )
 
 
 def decision_models(rows: list[dict]) -> list[str]:

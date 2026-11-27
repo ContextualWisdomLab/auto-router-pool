@@ -441,6 +441,13 @@ class SpecializedTest(unittest.TestCase):
             set(pool.specialized_models([])), {"image", "video", "audio", "ocr"}
         )
 
+    def test_a_batch_model_is_not_a_chat_candidate(self):
+        rows = [{"model_name": "batch", "litellm_params": {}, "model_info": {
+            "mode": "batch", "max_input_tokens": 400000,
+        }}]
+        self.assertEqual(pool.group_state(rows, "batch"), (False, "batch_model"))
+        self.assertEqual(pool.batch_models(rows), ["batch"])
+
 
 class DecisionCatalogTest(unittest.TestCase):
     CATALOG = {
