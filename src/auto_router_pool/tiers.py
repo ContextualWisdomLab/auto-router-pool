@@ -2,11 +2,13 @@
 
 Effort assignments come from the Artificial Analysis effort ladder, not from the
 tier name: a small model can lose about two thirds of its index at ``low``, so
-the light tiers run it at ``medium``/``high``; the top tiers use each model's
-measured peak effort, which is not always the same label (``max`` beats
-``xhigh`` for some models, and loses for others).
+the light tiers run it at ``medium``/``high``. The frontier tier is instead
+placed for equal score: its entries are fallbacks for the same request, so it
+targets the weakest ceiling in the chain instead of each model's own peak.
 """
 from __future__ import annotations
+
+from .assign import SPREAD, place
 
 ROUTERS = ("auto", "auto-classify", "auto-strix")
 
@@ -47,7 +49,31 @@ def _compact(tier_map: dict) -> dict:
     return cleaned
 
 
-def auto_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=(), top=None):
+def _frontier(premium, primary, runner_up, top, ladders, band):
+    """Top tier entries: score-equal when every model has a measured ladder."""
+    fallback = [
+        (premium, top.get(premium, "xhigh")),
+        (primary, top.get(primary, "xhigh")),
+        (runner_up, top.get(runner_up, "xhigh")),
+    ]
+    if not ladders:
+        return fallback
+    placed = place([premium, primary, runner_up], ladders, band)
+    if len(placed["entries"]) != 3:
+        return fallback
+    return [(model, effort) for model, effort, _ in placed["entries"]]
+
+
+def auto_tiers(
+    primary: str,
+    premium: str,
+    budget: str,
+    runner_up: str,
+    micro=(),
+    top=None,
+    ladders=None,
+    band: float = SPREAD,
+):
     micro = list(micro)[:2] + [""] * (2 - len(list(micro)[:2]))
     top = top or {}
     return _compact({
@@ -63,10 +89,8 @@ def auto_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=()
             (primary, "high"), (premium, "high"), (runner_up, "high")],
         "고난도 과제·심화 검토": [
             (primary, "high"), (premium, "high"), (runner_up, "high")],
-        "최고난도 추론·심층 연구·복잡한 장기 작업": [
-            (premium, top.get(premium, "xhigh")),
-            (primary, top.get(primary, "xhigh")),
-            (runner_up, top.get(runner_up, "xhigh"))],
+        "최고난도 추론·심층 연구·복잡한 장기 작업": _frontier(
+            premium, primary, runner_up, top, ladders, band),
     })
 
 
@@ -91,14 +115,26 @@ def strix_tiers(primary: str, premium: str, budget: str, runner_up: str, micro=(
     })
 
 
-def routers(primary: str, premium: str, budget: str, runner_up: str, micro=(), top=None):
+def routers(
+    primary: str,
+    premium: str,
+    budget: str,
+    runner_up: str,
+    micro=(),
+    top=None,
+    ladders=None,
+    band: float = SPREAD,
+):
     """Map router name -> tier spec.
 
-    ``top`` maps a model to its highest measured effort; the top tiers use it so
-    each fallback runs at its own ceiling instead of a shared label.
+    ``top`` maps a model to its highest measured effort, used where a tier holds
+    a single model. ``ladders`` maps a model to its full measured ladder so the
+    frontier tier can be placed for equal score instead.
     """
     return {
-        "auto": auto_tiers(primary, premium, budget, runner_up, micro, top),
+        "auto": auto_tiers(
+            primary, premium, budget, runner_up, micro, top, ladders, band
+        ),
         "auto-classify": classify_tiers(primary, premium, budget, runner_up, micro),
         "auto-strix": strix_tiers(primary, premium, budget, runner_up, micro, top),
     }
