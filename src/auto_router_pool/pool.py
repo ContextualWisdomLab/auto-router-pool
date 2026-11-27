@@ -38,15 +38,21 @@ def changed_scores(hashes: dict[str, str], previous: dict[str, str]) -> list[str
 
 # Operators only route long-context traffic, so a group below this window is not
 # a candidate: it would either be filtered out per request or truncate silently.
-MIN_INPUT_TOKENS = 128_000
+MIN_INPUT_TOKENS = 200_000
 
 
 def input_window(rows: list[dict], name: str) -> int:
-    """Largest declared input window in a group; 0 when nothing is declared."""
+    """Largest declared input window among usable deployments in a group.
+
+    When every deployment in the group is blocked, falls back to all
+    deployments so quarantine recovery can still judge eligibility.
+    """
+    group = [row for row in rows if row["model_name"] == name]
+    active = [row for row in group if not (row.get("model_info") or {}).get("blocked")]
+    pool_rows = active or group
     values = [
         (row.get("model_info") or {}).get("max_input_tokens")
-        for row in rows
-        if row["model_name"] == name
+        for row in pool_rows
     ]
     known = [value for value in values if type(value) is int and value > 0]
     return max(known) if known else 0
