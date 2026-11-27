@@ -38,7 +38,7 @@ def changed_scores(hashes: dict[str, str], previous: dict[str, str]) -> list[str
 
 # Operators only route long-context traffic, so a group below this window is not
 # a candidate: it would either be filtered out per request or truncate silently.
-MIN_INPUT_TOKENS = 272_000
+MIN_INPUT_TOKENS = 128_000
 
 
 def input_window(rows: list[dict], name: str) -> int:
@@ -527,7 +527,7 @@ def decision_candidates(rows: list[dict], catalog: dict | None = None,
     score per original input dollar. A free tier is priced at its paid base, so
     zero price cannot manufacture a winner; only an equal value lets the
     actually-free deployment break the tie. Unmeasured models fall back to
-    original input price, then name. The 272k solver floor does not apply: the
+    original input price, then name. The 128k solver floor does not apply: the
     classifier reads a short prompt, not the request.
     """
     groups: dict[str, list[dict]] = {}

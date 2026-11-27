@@ -111,7 +111,7 @@ def context_sync_pass(client, rows: list[dict], prices: dict | None = None,
     """Fill missing context windows from LiteLLM's own model catalogue.
 
     Deployments registered without an upstream catalogue entry keep no
-    ``max_input_tokens``, so the pool treats them as below the 272k floor.
+    ``max_input_tokens``, so the pool treats them as below the 128k floor.
     LiteLLM's price/context map is keyed by model name; a tail match is enough
     because the gateway often stores a provider-prefixed variant of the same
     model. Only a missing window is touched, so an operator's explicit value
@@ -201,6 +201,66 @@ def effort_suffix_pass(client, rows: list[dict], prices: dict | None = None,
             result = client.patch(
                 f"/model/{urllib.parse.quote(identifier, safe='')}/update",
                 {"litellm_params": {"model": repaired}},
+            )
+            if result.get("error_status") is not None:
+                changes.append({
+                    "model": row["model_name"], "deployment": identifier,
+                    "action": "failed", "detail": f"error_{result['error_status']}",
+                })
+                continue
+        changes.append({
+            "model": row["model_name"], "deployment": identifier,
+            "action": "updated" if apply else "would_update",
+            "from": model, "to": repaired,
+        })
+    return changes
+
+
+CHAT_ONLY_API_HOSTS = frozenset({"integrate.api.nvidia.com"})
+
+
+def chat_only_transport_pass(client, rows: list[dict], apply: bool = False) -> list[dict]:
+    """Use ``hosted_vllm`` for chat-only OpenAI-compatible hosts.
+
+    LiteLLM routes Anthropic ``/v1/messages`` requests for ``openai/``
+    deployments through the OpenAI Responses API (``/v1/responses``) and
+    rejects ``reasoning_effort`` for unknown OpenAI model names. Hosts such as
+    NVIDIA NIM only expose ``/v1/chat/completions``, so registering them as
+    ``openai/`` breaks ``/v1/messages`` with 404. Moving them to
+    ``hosted_vllm/`` keeps ``/v1/chat/completions`` and supports reasoning
+    parameters on both OpenAI and Anthropic surfaces.
+    """
+    changes = []
+    for row in rows:
+        params = row.get("litellm_params") or {}
+        api_base = str(params.get("api_base") or "")
+        host = (urllib.parse.urlparse(api_base).hostname or "").casefold()
+        if host not in CHAT_ONLY_API_HOSTS:
+            continue
+        model = str(params.get("model") or "")
+        custom_provider = str(params.get("custom_llm_provider") or "")
+        info = row.get("model_info") or {}
+        info_provider = str(info.get("litellm_provider") or "")
+        needs_model = model.startswith("openai/")
+        needs_provider = custom_provider == "openai" or info_provider == "openai"
+        if not needs_model and not needs_provider:
+            continue
+        identifier = info.get("id")
+        if not identifier:
+            continue
+        repaired = "hosted_vllm/" + model[len("openai/"):] if needs_model else model
+        payload: dict = {
+            "litellm_params": {
+                "model": repaired,
+                "custom_llm_provider": "hosted_vllm",
+            }
+        }
+        if info_provider == "openai":
+            payload["model_info"] = {"litellm_provider": "hosted_vllm"}
+        if apply:
+            result = client.patch(
+                f"/model/{urllib.parse.quote(identifier, safe='')}/update",
+                payload,
             )
             if result.get("error_status") is not None:
                 changes.append({
