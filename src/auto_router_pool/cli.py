@@ -43,6 +43,7 @@ from .catalog import sync_batch
 from .extra_catalogs import sync_all as sync_provider_catalogs
 from .maintenance import (
     context_sync_pass,
+    effort_suffix_pass,
     health_report,
     prompt_cache_drop_pass,
     provider_prefix_pass,
@@ -413,6 +414,9 @@ def run(args) -> int:
                 litellm, rows, apply=args.apply
             )
             output["context_sync"] = context_sync_pass(
+                litellm, rows, prices, apply=args.apply
+            )
+            output["effort_suffix"] = effort_suffix_pass(
                 litellm, rows, prices, apply=args.apply
             )
         if args.repair_cooldowns:

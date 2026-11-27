@@ -159,6 +159,63 @@ def context_sync_pass(client, rows: list[dict], prices: dict | None = None,
     return changes
 
 
+EFFORT_SUFFIXES = ("-high", "-low", "-medium", "-max", "-xhigh", "-mini")
+
+
+def effort_suffix_pass(client, rows: list[dict], prices: dict | None = None,
+                      apply: bool = False) -> list[dict]:
+    """Drop a trailing effort suffix from a model string.
+
+    A registration sometimes stores an effort variant (``gemini-3.8-flash-high``)
+    as if it were a model. LiteLLM then has no such upstream model and returns
+    404 / "unknown provider". When the unsuffixed model is known to exist, the
+    suffix is stripped so the deployment calls the real model.
+    """
+    known: set[str] = set()
+    for key in (prices or {}):
+        known.add(str(key).split("/")[-1])
+    for row in rows:
+        known.add(str(row.get("model_name") or "").split("/")[-1])
+
+    changes = []
+    for row in rows:
+        params = row.get("litellm_params") or {}
+        model = str(params.get("model") or "")
+        if not model or "/" not in model:
+            continue
+        prefix, separator, tail = model.rpartition("/")
+        base_tail = None
+        for suffix in EFFORT_SUFFIXES:
+            if tail.endswith(suffix):
+                candidate = tail[: -len(suffix)]
+                if candidate in known:
+                    base_tail = candidate
+                    break
+        if base_tail is None:
+            continue
+        identifier = (row.get("model_info") or {}).get("id")
+        if not identifier:
+            continue
+        repaired = prefix + "/" + base_tail
+        if apply:
+            result = client.patch(
+                f"/model/{urllib.parse.quote(identifier, safe='')}/update",
+                {"litellm_params": {"model": repaired}},
+            )
+            if result.get("error_status") is not None:
+                changes.append({
+                    "model": row["model_name"], "deployment": identifier,
+                    "action": "failed", "detail": f"error_{result['error_status']}",
+                })
+                continue
+        changes.append({
+            "model": row["model_name"], "deployment": identifier,
+            "action": "updated" if apply else "would_update",
+            "from": model, "to": repaired,
+        })
+    return changes
+
+
 def pooled(params: dict) -> bool:
     """A CLIProxyAPI/Cursor bridge deployment whose cooldown this host owns."""
     from urllib.parse import urlsplit
