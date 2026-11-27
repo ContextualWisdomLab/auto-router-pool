@@ -49,6 +49,7 @@ from .pool import (
     score_hashes,
     stable_deployments,
     classifier_candidates,
+    decision_catalog,
     decision_classifier,
     decision_models,
     free_gaps,
@@ -617,6 +618,9 @@ def run(args) -> int:
         # Every group that could classify if it answered: a decision-only model,
         # or a chat model that also serves /v1/decisions.
         "classifier_candidates": classifier_candidates(rows, catalog),
+        # The catalogue's own decision models: what to look for (and register)
+        # when no deployed deployment can classify yet.
+        "decision_catalog": decision_catalog(catalog),
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

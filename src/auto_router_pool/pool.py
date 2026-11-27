@@ -222,6 +222,26 @@ def supports_decisions(row: dict, catalog: dict | None = None) -> bool:
     return any(word in text for word in DECISION_WORDS) and "not a chat" in text
 
 
+def decision_catalog(catalog: dict | None) -> list[dict]:
+    """Upstream models the catalogue itself marks as decision-capable.
+
+    This is how a supported classifier is *found* before anything is registered:
+    the catalogue's ``mode`` is the reference, so a deployment only has to exist
+    for the model to be usable.
+    """
+    out = []
+    for key, entry in sorted((catalog or {}).items()):
+        mode = str((entry or {}).get("mode") or "").lower()
+        if mode not in DECISION_MODES:
+            continue
+        out.append({
+            "model": key,
+            "mode": mode,
+            "max_input_tokens": (entry or {}).get("max_input_tokens"),
+        })
+    return out
+
+
 def classifier_candidates(rows: list[dict], catalog: dict | None = None) -> list[dict]:
     """Every group that can answer a decision request, and whether it can now.
 

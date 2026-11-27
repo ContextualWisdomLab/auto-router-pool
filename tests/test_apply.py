@@ -235,7 +235,7 @@ class ContractTest(unittest.TestCase):
 class MediaCapTest(unittest.TestCase):
     def test_media_deployments_do_not_bound_the_window(self):
         rows = [
-            {"model_name": "chatty", "model_info": {"id": "c", "mode": "chat", "max_input_tokens": 400000}},
+            {"model_name": "chatty", "model_info": {"id": "7b1c0e5a-3f2d-4a10-9c88-2f4f0d6a1b11", "mode": "chat", "max_input_tokens": 400000}},
             {"model_name": "painter", "model_info": {"id": "p", "mode": "image_generation"}},
         ]
         self.assertEqual(apply.context_cap(rows, {"T": ["chatty", "painter"]}), 400000)
@@ -255,7 +255,7 @@ class DecisionClassifierPlanTest(unittest.TestCase):
 
     def decision(self, blocked=False):
         return {"model_name": "clef", "litellm_params": {},
-                "model_info": {"id": "clef-1", "mode": "decision", "blocked": blocked}}
+                "model_info": {"id": "1f0b6c33-9c1e-4f57-8a2c-6d2b9e7c4a55", "mode": "decision", "blocked": blocked}}
 
     def test_plan_writes_the_decision_classifier(self):
         rows = [self.row(), model("small", 400000), self.decision()]

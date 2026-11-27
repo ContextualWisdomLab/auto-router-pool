@@ -319,7 +319,7 @@ class DefaultModelTest(unittest.TestCase):
 class DecisionClassifierTest(unittest.TestCase):
     def rows(self, blocked):
         return [{"model_name": "clef", "litellm_params": {},
-                 "model_info": {"id": "clef-1", "mode": "decision", "blocked": blocked}}]
+                 "model_info": {"id": "1f0b6c33-9c1e-4f57-8a2c-6d2b9e7c4a55", "mode": "decision", "blocked": blocked}}]
 
     def test_a_usable_decision_model_becomes_the_classifier(self):
         self.assertEqual(pool.decision_classifier(self.rows(False)), "clef")
@@ -370,7 +370,7 @@ class ClassifierCandidateTest(unittest.TestCase):
     def rows(self):
         return [
             {"model_name": "clef", "litellm_params": {},
-             "model_info": {"id": "c", "mode": "decisions", "blocked": True}},
+             "model_info": {"id": "5c9a1d20-8e7b-4c3a-9f10-3a2b6d4e8c77", "mode": "decisions", "blocked": True}},
             {"model_name": "luna", "litellm_params": {},
              "model_info": {"mode": "chat", "blocked": False,
                             "supported_endpoints": ["/v1/chat/completions", "/v1/decisions"]}},
@@ -388,3 +388,26 @@ class ClassifierCandidateTest(unittest.TestCase):
 
     def test_the_unblocked_capable_model_wins(self):
         self.assertEqual(pool.decision_classifier(self.rows()), "luna")
+
+
+class DecisionCatalogTest(unittest.TestCase):
+    CATALOG = {
+        "typesafe/jev-latest": {"mode": "evaluation", "max_input_tokens": 32000},
+        "openrouter/typesafe/jev-router": {"mode": "chat"},
+        "cloudflare/clef": {"mode": "decisions", "max_input_tokens": 131072},
+        "openai/gpt-6.1-sol": {"mode": "chat", "max_input_tokens": 1000000},
+    }
+
+    def test_the_catalogue_lists_what_can_classify(self):
+        self.assertEqual(
+            [entry["model"] for entry in pool.decision_catalog(self.CATALOG)],
+            ["cloudflare/clef", "typesafe/jev-latest"],
+        )
+
+    def test_a_catalogue_entry_is_matched_by_upstream_name(self):
+        row = {"model_name": "jev", "litellm_params": {"model": "typesafe/jev-latest"},
+               "model_info": {"mode": "chat"}}
+        self.assertTrue(pool.supports_decisions(row, self.CATALOG))
+        chat_row = {"model_name": "jev", "litellm_params": {"model": "openrouter/typesafe/jev-router"},
+                    "model_info": {"mode": "chat", "supported_endpoints": ["/v1/decisions"]}}
+        self.assertFalse(pool.supports_decisions(chat_row, self.CATALOG))
