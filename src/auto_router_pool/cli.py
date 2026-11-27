@@ -37,11 +37,15 @@ from .pool import (
     flaky_deployments,
     group_state,
     input_window,
+    pick_default,
     pick_micro,
     score_hashes,
     stable_deployments,
+    decision_models,
+    free_gaps,
     free_models,
 )
+from .registry import ensure_guests, load_guests, registered
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
 
 
@@ -285,6 +289,26 @@ def parse_args(argv=None):
     parser.add_argument("--watch", action="store_true", help="skip refresh when catalogue and policy match")
     parser.add_argument("--refresh-scores", action="store_true", help="re-read every AA page")
     parser.add_argument("--smoke", action="store_true", help="one tiny auto completion after applying")
+    parser.add_argument(
+        "--register", action="store_true",
+        help="register declared guest models that the catalogue does not carry",
+    )
+    parser.add_argument(
+        "--guests", type=Path, default=None,
+        help="guest declarations (default: <home>/auto-pool-guests.json)",
+    )
+    parser.add_argument(
+        "--live-fallbacks", action="store_true",
+        help="keep every fallback chain ending on a live model (own run, no tier write)",
+    )
+    parser.add_argument(
+        "--prices", type=Path, default=None,
+        help="pinned LiteLLM price map for --live-fallbacks",
+    )
+    parser.add_argument(
+        "--seed-file", type=Path, default=None,
+        help='JSON {"group": "deployment-id"} to unblock for --live-fallbacks',
+    )
     parser.add_argument("--env-file", type=Path, default=None, help="file with KEY=VALUE secrets")
     parser.add_argument("--home", type=Path, default=None, help="state, cache and backup directory")
     parser.add_argument("--prefix", default="", help="only models whose id starts with this")
@@ -303,6 +327,22 @@ def run(args) -> int:
         settings.home = args.home
     if args.micro is not None:
         settings.micro = csv(args.micro)
+
+    if args.live_fallbacks:
+        # The fallback sanitizer ships in this package (``live.py``). Running it
+        # through this flag leaves the host nothing to schedule but one script,
+        # instead of a wrapper that re-declares the same paths and flags.
+        from .live import main as live_main
+
+        argv = ["--apply"] if args.apply else []
+        if args.env_file:
+            argv += ["--env-file", str(args.env_file)]
+        argv += ["--base-url", settings.litellm_base]
+        if args.prices:
+            argv += ["--prices", str(args.prices)]
+        if args.seed_file:
+            argv += ["--seed-file", str(args.seed_file)]
+        return live_main(argv)
     missing = required_env(settings)
     if missing:
         print(json.dumps({"error": "missing environment", "names": missing}))
@@ -320,6 +360,28 @@ def run(args) -> int:
 
     litellm = Client(settings.litellm_base, settings.key)
     rows = models(litellm)
+
+    # Guests are models the operator can use that no catalogue sync carries: a
+    # free upstream router, a decision endpoint, a preview alias. They are
+    # declared in a file and registered here, because a model the router does
+    # not know about cannot be routed to at all.
+    guests = load_guests(args.guests or (settings.home / "auto-pool-guests.json"))
+    guest_results: list[dict] = []
+    if guests and args.register:
+        if args.apply:
+            guest_results = ensure_guests(litellm, guests, rows)
+            rows = models(litellm)  # the new groups are routable from here on
+        else:
+            guest_results = [
+                {
+                    "model": guest["model_name"],
+                    "action": (
+                        "present" if registered(rows, guest["model_name"])
+                        else "would_register"
+                    ),
+                }
+                for guest in guests
+            ]
 
     # LiteLLM's registrations are the routing truth: a model the proxy lists but
     # LiteLLM does not register can never serve a request. The proxy stays an
@@ -482,8 +544,13 @@ def run(args) -> int:
     )
     # The classifier contract travels with the tiers: LiteLLM rejects a tier map
     # that does not cover every defined tier, so both are written in one patch.
+    # The default path has no tier config, so it answers at the model's own
+    # default effort; rank by what each candidate can promise there.
+    default, default_note = pick_default(
+        rows, candidates, [primary[0], premium[0], runner_up]
+    )
     changes = plan(
-        rows, router_map, primary[0], runner_up,
+        rows, router_map, default, runner_up,
         extras=policies(router_map),
     )
     summary = {
@@ -505,6 +572,13 @@ def run(args) -> int:
             "efforts": dict(router_map["auto"][FRONTIER]),
         },
         "specialized": specialized,
+        # Free groups the pool cannot route yet, so a registered-but-blocked or
+        # still-unmeasured free model is visible instead of silently absent.
+        "free_gaps": free_gaps(rows, candidates),
+        # Decision models answer a schema, not a chat turn: never tier members.
+        "decision_models": decision_models(rows),
+        "guests": guest_results,
+        "default_model": {"model": default, **default_note},
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

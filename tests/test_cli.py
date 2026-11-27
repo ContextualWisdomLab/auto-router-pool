@@ -387,3 +387,48 @@ class RefreshTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveFallbackDispatchTest(unittest.TestCase):
+    """The host wrapper is now a flag, so only one script has to be scheduled."""
+
+    def test_live_fallbacks_delegates_to_the_packaged_sanitizer(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        env = Path(tempfile.mkdtemp()) / "gateway.env"
+        env.write_text("LITELLM_MASTER_KEY=test-key\n")
+        seen = {}
+
+        def fake_main(argv):
+            seen["argv"] = argv
+            return 0
+
+        with mock.patch("auto_router_pool.live.main", fake_main):
+            code = cli.run(cli.parse_args(
+                ["--live-fallbacks", "--apply", "--env-file", str(env)]
+            ))
+
+        self.assertEqual(code, 0)
+        self.assertIn("--apply", seen["argv"])
+        self.assertIn("--base-url", seen["argv"])
+        self.assertIn(str(env), seen["argv"])
+
+    def test_a_preview_run_forwards_no_apply_flag(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        env = Path(tempfile.mkdtemp()) / "gateway.env"
+        env.write_text("LITELLM_MASTER_KEY=test-key\n")
+        seen = {}
+
+        def fake_main(argv):
+            seen["argv"] = argv
+            return 0
+
+        with mock.patch("auto_router_pool.live.main", fake_main):
+            cli.run(cli.parse_args(["--live-fallbacks", "--env-file", str(env)]))
+
+        self.assertNotIn("--apply", seen["argv"])

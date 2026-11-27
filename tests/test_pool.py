@@ -168,6 +168,78 @@ class FreeModelsTest(unittest.TestCase):
         )
 
 
+class DecisionModelTest(unittest.TestCase):
+    def row(self, name, info):
+        return {"model_name": name, "model_info": info}
+
+    def test_a_decision_mode_is_recognised(self):
+        rows = [self.row("dec", {"mode": "decision"}), self.row("chatty", {"mode": "chat"})]
+        self.assertEqual(pool.decision_models(rows), ["dec"])
+
+    def test_an_evaluation_mode_is_recognised(self):
+        # The price catalogue files the jev variants under 'evaluation'.
+        self.assertEqual(pool.decision_models([self.row("judge", {"mode": "evaluation"})]),
+                         ["judge"])
+
+    def test_a_decision_endpoint_is_recognised(self):
+        rows = [self.row("clef", {"mode": "chat",
+                                   "supported_endpoints": ["/v1/systemone"]})]
+        self.assertEqual(pool.decision_models(rows), ["clef"])
+
+    def test_a_described_decision_model_is_recognised(self):
+        rows = [self.row("clef-flash", {"mode": "chat", "description":
+                          "a 9B decision model returning probabilities; not a chat model"})]
+        self.assertEqual(pool.decision_models(rows), ["clef-flash"])
+
+    def test_a_chat_model_with_a_decisions_endpoint_is_not_a_decision_model(self):
+        # gpt-6-luna lists /v1/chat/completions and /v1/decisions: it is a chat
+        # model that can also decide, not a decision-only endpoint.
+        rows = [self.row("luna", {"mode": "chat", "supported_endpoints": [
+            "/v1/chat/completions", "/v1/batch", "/v1/decisions"]})]
+        self.assertEqual(pool.decision_models(rows), [])
+
+    def test_a_plain_chat_model_is_not_a_decision_model(self):
+        rows = [self.row("gpt", {"mode": "chat", "description": "general chat model"})]
+        self.assertEqual(pool.decision_models(rows), [])
+
+
+class FreeGapsTest(unittest.TestCase):
+    def row(self, name, upstream, blocked=False, window=400000, info=None):
+        return {
+            "model_name": name,
+            "litellm_params": {"model": upstream},
+            "model_info": dict({"blocked": blocked, "max_input_tokens": window}, **(info or {})),
+        }
+
+    def test_a_blocked_free_group_is_reported_with_its_reason(self):
+        rows = [self.row("free-blocked", "openrouter/x/y:free", blocked=True)]
+        self.assertEqual(
+            pool.free_gaps(rows, {}),
+            [{"model": "free-blocked", "reason": "all_blocked"}],
+        )
+
+    def test_a_usable_free_group_without_a_score_is_unmeasured(self):
+        rows = [self.row("free-unrated", "openrouter/x/y:free")]
+        self.assertEqual(
+            pool.free_gaps(rows, {}),
+            [{"model": "free-unrated", "reason": "unmeasured"}],
+        )
+
+    def test_a_small_context_free_group_is_reported_below_the_floor(self):
+        rows = [self.row("free-small", "openrouter/x/y:free", window=65536)]
+        self.assertEqual(
+            pool.free_gaps(rows, {}),
+            [{"model": "free-small", "reason": "context_below_floor"}],
+        )
+
+    def test_a_scored_free_group_is_not_a_gap(self):
+        rows = [self.row("free-scored", "openrouter/x/y:free")]
+        self.assertEqual(pool.free_gaps(rows, {"free-scored": {}}), [])
+
+    def test_a_paid_group_is_never_reported(self):
+        self.assertEqual(pool.free_gaps([self.row("paid", "openai/paid")], {}), [])
+
+
 class PickMicroTest(unittest.TestCase):
     def test_taken_roles_are_excluded(self):
         candidates = {
@@ -198,3 +270,47 @@ class PickMicroTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefaultModelTest(unittest.TestCase):
+    """The default path has no tier config, so it runs at the model's own effort."""
+
+    SHARP_AT_MAX = {
+        "max": {"index": 60.0, "in": 1, "out": 1},
+        "low": {"index": 30.0, "in": 1, "out": 1},
+    }
+    STRONG_ANYWHERE = {
+        "max": {"index": 55.0, "in": 1, "out": 1},
+        "low": {"index": 45.0, "in": 1, "out": 1},
+    }
+
+    def test_a_declared_default_effort_is_scored_at_that_rung(self):
+        rows = [{"model_name": "a", "litellm_params": {"reasoning_effort": "max"}}]
+        picked, note = pool.pick_default(
+            rows, {"a": self.SHARP_AT_MAX, "b": self.STRONG_ANYWHERE}, ["a", "b"]
+        )
+        self.assertEqual((picked, note["basis"], note["effort"]), ("a", "declared", "max"))
+        self.assertEqual(note["index"], 60.0)
+
+    def test_without_a_declared_default_the_floor_decides(self):
+        picked, note = pool.pick_default(
+            [], {"a": self.SHARP_AT_MAX, "b": self.STRONG_ANYWHERE}, ["a", "b"]
+        )
+        self.assertEqual((picked, note["basis"], note["effort"]), ("b", "floor", None))
+        self.assertEqual(note["index"], 45.0)
+
+    def test_siblings_that_disagree_declare_nothing(self):
+        rows = [
+            {"model_name": "a", "litellm_params": {"reasoning_effort": "high"}},
+            {"model_name": "a", "litellm_params": {"reasoning_effort": "low"}},
+        ]
+        self.assertIsNone(pool.declared_effort(rows, "a"))
+
+    def test_a_tie_keeps_the_pool_preference(self):
+        same = {"max": {"index": 50.0, "in": 1, "out": 1}}
+        picked, _ = pool.pick_default([], {"a": same, "b": same}, ["a", "b"])
+        self.assertEqual(picked, "a")
+
+    def test_an_unmeasured_model_never_beats_a_measured_one(self):
+        picked, _ = pool.pick_default([], {"a": {}, "b": self.STRONG_ANYWHERE}, ["a", "b"])
+        self.assertEqual(picked, "b")

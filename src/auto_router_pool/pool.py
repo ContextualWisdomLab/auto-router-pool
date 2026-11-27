@@ -131,6 +131,122 @@ def free_models(rows: list[dict]) -> set[str]:
     return free
 
 
+# A decision model answers a schema of typed questions in one forward pass and
+# returns calibrated probabilities. It is not a chat or streaming model, so it
+# can never fill a routing tier however cheap it is.
+DECISION_MODES = {"decision", "evaluation"}
+DECISION_ENDPOINTS = ("/v1/decisions", "/decisions", "/v1/systemone", "/systemone")
+DECISION_WORDS = ("decision model",)
+
+
+def is_decision(row: dict) -> bool:
+    """The registration says this model decides rather than chats.
+
+    A chat model can also expose a decisions endpoint (``gpt-6-luna`` lists
+    ``/v1/chat/completions`` and ``/v1/decisions``), so an endpoint alone proves
+    nothing: the decision endpoints have to be the model's whole surface.
+    """
+    info = row.get("model_info") or {}
+    if str(info.get("mode") or "").lower() in DECISION_MODES:
+        return True
+    endpoints = [str(e).lower() for e in (info.get("supported_endpoints") or [])]
+    if any(marker in " ".join(endpoints) for marker in DECISION_ENDPOINTS) and not any(
+        "chat/completions" in endpoint for endpoint in endpoints
+    ):
+        return True
+    text = f"{info.get('description') or ''} {info.get('availability') or ''}".lower()
+    return any(word in text for word in DECISION_WORDS) and "not a chat" in text
+
+
+def decision_models(rows: list[dict]) -> list[str]:
+    """Groups that are decision models, reported instead of looking broken.
+
+    They are legitimate to register and cheap to run, but a chat tier can never
+    use one: the request shape is a decision schema, not a conversation. Naming
+    them keeps them out of the "blocked model" bucket and out of every tier.
+    """
+    return sorted(
+        name for name in {row["model_name"] for row in rows}
+        if any(is_decision(row) for row in rows if row["model_name"] == name)
+    )
+
+
+def free_gaps(rows: list[dict], scored) -> list[dict]:
+    """Free groups the router cannot use yet, each with the reason.
+
+    A free group only earns its place in a chain once the router can actually
+    select it, so a group that is registered but blocked, below the context
+    floor, or simply unmeasured would otherwise disappear without a trace.
+    This reports them instead: the model name and why it is not in the pool.
+    """
+    free = free_models(rows)
+    if not free:
+        return []
+    known = set(scored or ())
+    gaps = []
+    for name in sorted(free):
+        if name in known:
+            continue
+        usable, reason = group_state(rows, name)
+        gaps.append({"model": name, "reason": "unmeasured" if usable else reason})
+    return gaps
+
+
+def declared_effort(rows: list[dict], name: str) -> str | None:
+    """The effort this group runs at when a request names none.
+
+    Only a deployment-level ``reasoning_effort`` states it. Sibling deployments
+    that disagree do not describe one default, so nothing is claimed then.
+    """
+    values = {
+        (row.get("litellm_params") or {}).get("reasoning_effort")
+        for row in rows if row["model_name"] == name
+    }
+    values.discard(None)
+    values.discard("")
+    return values.pop() if len(values) == 1 else None
+
+
+def effort_floor(variants: dict) -> float | None:
+    """Index at the weakest measured effort.
+
+    A request that names no effort may be served at any rung, so the lowest one
+    is the quality the router can actually promise on its default path.
+    """
+    indexes = [
+        entry.get("index") for entry in (variants or {}).values()
+        if entry.get("index")
+    ]
+    return min(indexes) if indexes else None
+
+
+def pick_default(rows: list[dict], candidates: dict[str, dict], preferred) -> tuple:
+    """Fallback model for a request the classifier cannot place in a tier.
+
+    The default path carries no ``tier_model_configs`` entry, so it runs at the
+    model's own default effort instead of the rung its best score was measured
+    at. A declared deployment default is scored at that rung; without one the
+    model is scored at its measured floor, which is what the router can promise
+    there. Ties keep the caller's preference order.
+    """
+    ranked = []
+    for order, name in enumerate(preferred):
+        variants = candidates.get(name) or {}
+        effort = declared_effort(rows, name)
+        entry = variants.get(effort) if effort else None
+        if entry and entry.get("index"):
+            index, basis = entry["index"], "declared"
+        else:
+            index, basis, effort = effort_floor(variants), "floor", None
+        ranked.append((index or 0, -order, name, basis, effort))
+    best = max(ranked)
+    return best[2], {
+        "basis": best[3],
+        "effort": best[4],
+        "index": round(best[0], 1) if best[0] else None,
+    }
+
+
 def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: str = "low"):
     """Cheapest remaining candidates, so light tiers need no supplied list.
 

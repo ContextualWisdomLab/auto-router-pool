@@ -53,6 +53,13 @@ the same model at `max`.
    timeout. It runs on every routed request, so it must be a model the router
    already selects and one with headroom: a stale classifier times out, and the
    cheapest model is usually the first to be rate-limited.
+
+   The *default* model -- the path a request takes when no tier is chosen -- has
+   no `tier_model_configs` entry, so it answers at its own default effort rather
+   than at the rung its best score was measured at. Candidates are ranked at
+   that effort: at the deployment's declared `reasoning_effort` when one exists,
+   and otherwise at the lowest rung they measured, which is the floor the default
+   path can promise. Ties keep the pool's preference order.
 5. **Diff** each router's tiers, efforts, context floor and classifier, validate
    server-side, back up, patch, re-read, and roll back on any mismatch.
 6. **Cap the advertised window** at the smallest `max_input_tokens` among the
@@ -164,6 +171,54 @@ any paid deployment does not qualify, because the router could reach that one.
 Cost fields cannot decide this in either direction, so they are not consulted: a
 registration that was never priced declares zero, and a free tier may still carry
 a price.
+
+### Guest models
+
+Some deployments are never discovered by a catalogue sync: a free upstream
+router, a decision endpoint, a preview alias. They are declared in
+`auto-pool-guests.json` under the pool home and registered by `--register`
+(which previews unless `--apply` is also given):
+
+```json
+{"models": [{"model_name": "jev",
+             "litellm_params": {"model": "openrouter/typesafe/jev-router",
+                                "api_base": "https://openrouter.ai/api/v1",
+                                "litellm_credential_name": "OpenRouter"},
+             "model_info": {"mode": "chat", "max_input_tokens": 1000000,
+                            "is_free": true}}]}
+```
+
+A guest registers once and is then left alone. One that registers but cannot
+answer a one-token probe is deleted again, so a stale declaration never leaves a
+dead model group behind. A **decision** guest (`"mode": "decision"`) is probed on
+its decision endpoint instead: a chat probe cannot reach it, and a shape error
+(400/422) is proof the route exists while an auth or alias error (401/403/404)
+is proof the registration is wrong. The name is the operator's choice — what
+identifies a decision model is the endpoint it exposes, not what it is called.
+
+```json
+{"model_name": "my-decision",
+ "litellm_params": {"model": "openai/some-alias", "api_base": "https://…/v1",
+                    "litellm_credential_name": "shared"},
+ "model_info": {"mode": "decision"}}
+```
+
+### Live fallbacks
+
+`--live-fallbacks --apply` runs the fallback sanitizer in this package
+(`live.py`): dead targets are stripped from every chain and the graph ends on a
+live model, with `--prices` and `--seed-file` as its inputs. It is a separate
+run from tier planning because the two write different things (router settings
+vs. router tiers), and keeping them apart means one failing never half-applies
+the other.
+
+A **decision model** is a different kind of endpoint, not a cheaper chat model: it
+takes a state plus a schema of typed questions and returns calibrated
+probabilities in one forward pass, so it can never fill a routing tier. Such a
+group is recognised from registration metadata — a `mode` of `decision` or
+`evaluation`, a `/v1/decisions` or `/v1/systemone` endpoint, or a description that
+says so — and is listed separately in the run summary rather than counted as a
+broken chat candidate.
 
 ## Flaky deployments
 
