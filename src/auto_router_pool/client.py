@@ -104,18 +104,18 @@ DECISION_PATHS = ("/v1/decisions", "/v1/systemone")
 
 # The smallest well-formed choice question: one label has to come back, which is
 # the same shape the router asks the classifier for a tier.
+# The wire shape LiteLLM validates: a choice question carries option objects, each
+# with a ``value``, and nothing nests under a ``choice`` key.
 DECISION_CHOICE = {
     "questions": [
         {
             "type": "choice",
-            "choice": {
-                "instructions": "Which routing tier fits this request?",
-                "choices": {
-                    "SIMPLE": "a single lookup or rewrite",
-                    "MEDIUM": "an ordinary implementation request",
-                    "COMPLEX": "multi-step work across several files",
-                },
-            },
+            "instructions": "Which routing tier fits this request?",
+            "choices": [
+                {"value": "SIMPLE", "description": "a single lookup or rewrite"},
+                {"value": "MEDIUM", "description": "an ordinary implementation request"},
+                {"value": "COMPLEX", "description": "multi-step work across several files"},
+            ],
         }
     ]
 }
