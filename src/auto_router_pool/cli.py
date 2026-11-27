@@ -40,6 +40,7 @@ from .pool import (
     pick_micro,
     score_hashes,
     stable_deployments,
+    free_gaps,
     free_models,
 )
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
@@ -505,6 +506,9 @@ def run(args) -> int:
             "efforts": dict(router_map["auto"][FRONTIER]),
         },
         "specialized": specialized,
+        # Free groups the pool cannot route yet, so a registered-but-blocked or
+        # still-unmeasured free model is visible instead of silently absent.
+        "free_gaps": free_gaps(rows, candidates),
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

@@ -131,6 +131,27 @@ def free_models(rows: list[dict]) -> set[str]:
     return free
 
 
+def free_gaps(rows: list[dict], scored) -> list[dict]:
+    """Free groups the router cannot use yet, each with the reason.
+
+    A free group only earns its place in a chain once the router can actually
+    select it, so a group that is registered but blocked, below the context
+    floor, or simply unmeasured would otherwise disappear without a trace.
+    This reports them instead: the model name and why it is not in the pool.
+    """
+    free = free_models(rows)
+    if not free:
+        return []
+    known = set(scored or ())
+    gaps = []
+    for name in sorted(free):
+        if name in known:
+            continue
+        usable, reason = group_state(rows, name)
+        gaps.append({"model": name, "reason": "unmeasured" if usable else reason})
+    return gaps
+
+
 def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: str = "low"):
     """Cheapest remaining candidates, so light tiers need no supplied list.
 

@@ -168,6 +168,43 @@ class FreeModelsTest(unittest.TestCase):
         )
 
 
+class FreeGapsTest(unittest.TestCase):
+    def row(self, name, upstream, blocked=False, window=400000, info=None):
+        return {
+            "model_name": name,
+            "litellm_params": {"model": upstream},
+            "model_info": dict({"blocked": blocked, "max_input_tokens": window}, **(info or {})),
+        }
+
+    def test_a_blocked_free_group_is_reported_with_its_reason(self):
+        rows = [self.row("free-blocked", "openrouter/x/y:free", blocked=True)]
+        self.assertEqual(
+            pool.free_gaps(rows, {}),
+            [{"model": "free-blocked", "reason": "all_blocked"}],
+        )
+
+    def test_a_usable_free_group_without_a_score_is_unmeasured(self):
+        rows = [self.row("free-unrated", "openrouter/x/y:free")]
+        self.assertEqual(
+            pool.free_gaps(rows, {}),
+            [{"model": "free-unrated", "reason": "unmeasured"}],
+        )
+
+    def test_a_small_context_free_group_is_reported_below_the_floor(self):
+        rows = [self.row("free-small", "openrouter/x/y:free", window=65536)]
+        self.assertEqual(
+            pool.free_gaps(rows, {}),
+            [{"model": "free-small", "reason": "context_below_floor"}],
+        )
+
+    def test_a_scored_free_group_is_not_a_gap(self):
+        rows = [self.row("free-scored", "openrouter/x/y:free")]
+        self.assertEqual(pool.free_gaps(rows, {"free-scored": {}}), [])
+
+    def test_a_paid_group_is_never_reported(self):
+        self.assertEqual(pool.free_gaps([self.row("paid", "openai/paid")], {}), [])
+
+
 class PickMicroTest(unittest.TestCase):
     def test_taken_roles_are_excluded(self):
         candidates = {
