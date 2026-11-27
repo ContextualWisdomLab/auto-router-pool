@@ -411,3 +411,25 @@ class DecisionCatalogTest(unittest.TestCase):
         chat_row = {"model_name": "jev", "litellm_params": {"model": "openrouter/typesafe/jev-router"},
                     "model_info": {"mode": "chat", "supported_endpoints": ["/v1/decisions"]}}
         self.assertFalse(pool.supports_decisions(chat_row, self.CATALOG))
+
+
+class DecisionCandidateOrderTest(unittest.TestCase):
+    def rows(self):
+        return [
+            {"model_name": "luna", "litellm_params": {},
+             "model_info": {"mode": "chat", "blocked": False,
+                            "supported_endpoints": ["/v1/decisions"]}},
+            {"model_name": "clef", "litellm_params": {"model": "openai/clef"},
+             "model_info": {"id": "834d2f18-cd52-4a4a-9c4e-c6af91ee5a4a", "mode": "decision", "blocked": False,
+                            "description": "decision model; not a chat"}},
+            {"model_name": "jev", "litellm_params": {"model": "openrouter/typesafe/jev-1.13"},
+             "model_info": {"id": "b08f4d11-1869-440d-ae44-72f94902e4f9", "mode": "decision", "blocked": False}},
+        ]
+
+    def test_decision_only_models_come_first_then_capable_chat_models(self):
+        self.assertEqual(pool.decision_candidates(self.rows()), ["clef", "jev", "luna"])
+
+    def test_a_blocked_group_is_not_a_candidate(self):
+        rows = self.rows()
+        rows[1]["model_info"]["blocked"] = True
+        self.assertEqual(pool.decision_candidates(rows), ["jev", "luna"])

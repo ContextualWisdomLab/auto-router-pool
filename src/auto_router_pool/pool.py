@@ -267,8 +267,8 @@ def classifier_candidates(rows: list[dict], catalog: dict | None = None) -> list
     return out
 
 
-def decision_classifier(rows: list[dict], catalog: dict | None = None) -> str | None:
-    """A model this gateway can actually use as its decision classifier.
+def decision_candidates(rows: list[dict], catalog: dict | None = None) -> list[str]:
+    """Every decision-capable group with an unblocked deployment, in preference order.
 
     The router asks one question -- which tier -- and a decision endpoint answers
     that in one cheap forward pass instead of a chat completion. Models that are
@@ -284,11 +284,15 @@ def decision_classifier(rows: list[dict], catalog: dict | None = None) -> str | 
     capable = [
         name for name, group in groups.items()
         if any(supports_decisions(row, catalog) for row in group)
+        and any(not (row.get("model_info") or {}).get("blocked") for row in group)
     ]
-    for name in sorted(capable, key=lambda name: (name not in only, name)):
-        if any(not (row.get("model_info") or {}).get("blocked") for row in groups[name]):
-            return name
-    return None
+    return sorted(capable, key=lambda name: (name not in only, name))
+
+
+def decision_classifier(rows: list[dict], catalog: dict | None = None) -> str | None:
+    """The first decision model this gateway could use as its classifier."""
+    candidates = decision_candidates(rows, catalog)
+    return candidates[0] if candidates else None
 
 
 def free_gaps(rows: list[dict], scored) -> list[dict]:

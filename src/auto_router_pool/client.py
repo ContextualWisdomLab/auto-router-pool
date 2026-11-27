@@ -121,23 +121,49 @@ DECISION_CHOICE = {
 }
 
 
+# Cloudflare Clef answers the native System One route only, and says so when asked
+# on the OpenAI-shaped one, so both have to be tried before a model is written off.
+DECISION_SYSTEMONE = {
+    "state": "write a for loop",
+    "questions": {
+        "tier": {
+            "type": "choice",
+            "instructions": "Which routing tier fits this request?",
+            "criteria": {
+                "SIMPLE": "a single lookup or rewrite",
+                "MEDIUM": "an ordinary implementation request",
+                "COMPLEX": "multi-step work across several files",
+            },
+        }
+    },
+}
+
+
 def probe_decision_choice(client: Client, model: str):
     """Whether a deployment answers a real choice question.
 
-    A registration can claim ``/v1/decisions``, and a provider can accept the
-    route while the upstream model refuses the schema. Only a 200 proves the
-    classifier will work, so anything else keeps the LLM judge: swapping in a
+    Two routes exist for the same capability: the OpenAI-shaped ``/v1/decisions``
+    and the native ``/v1/systemone``. A registration can claim either, and a
+    provider can accept the route while refusing the shape, so only a 200 proves
+    the classifier will work -- anything else keeps the LLM judge, because a
     classifier that cannot answer would break routing outright.
     """
-    result = client.post(
-        "/v1/decisions",
-        {"model": model, "input": "write a for loop", **DECISION_CHOICE},
-        timeout=PROBE_TIMEOUT,
-    )
-    status = result.get("error_status")
-    if status is not None:
-        return False, f"unavailable_{status}"
-    return True, "ok"
+    last = "no_decision_route"
+    for path, extra in (
+        ("/v1/decisions", {"input": "write a for loop", **DECISION_CHOICE}),
+        ("/v1/systemone", DECISION_SYSTEMONE),
+    ):
+        result = client.post(
+            path, {"model": model, **extra}, timeout=PROBE_TIMEOUT
+        )
+        status = result.get("error_status")
+        if status is None:
+            return True, f"ok_{path.rsplit('/', 1)[-1]}"
+        last = f"unavailable_{status}"
+        if status not in (400, 401, 403, 404):
+            # A timeout or 5xx will not be fixed by the other route.
+            break
+    return False, last
 
 
 def probe_decision(client: Client, model: str):

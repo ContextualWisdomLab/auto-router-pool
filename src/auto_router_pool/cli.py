@@ -49,8 +49,8 @@ from .pool import (
     score_hashes,
     stable_deployments,
     classifier_candidates,
+    decision_candidates,
     decision_catalog,
-    decision_classifier,
     decision_models,
     free_gaps,
     free_models,
@@ -572,14 +572,17 @@ def run(args) -> int:
     # A decision model answers "which tier" in one forward pass, so it is the
     # classifier whenever the gateway can actually call one; the LLM judge is the
     # fallback, not the default.
-    decision = decision_classifier(rows, catalog)
-    if decision:
-        # Metadata only says the model should answer; the router only works if it
-        # actually does, so the judge is kept until a real choice comes back.
-        ok, reason = probe_decision_choice(litellm, decision)
-        if not ok:
-            status[decision] = f"classifier_{reason}"
-            decision = None
+    # Metadata only says a model should answer; the router only works if it
+    # actually does, so each candidate is tried until one returns a real choice.
+    # A decision model that fails its probe must not take the whole classifier
+    # down when a sibling can still answer.
+    decision = None
+    for candidate in decision_candidates(rows, catalog):
+        ok, reason = probe_decision_choice(litellm, candidate)
+        if ok:
+            decision = candidate
+            break
+        status[candidate] = f"classifier_{reason}"
     classifier = (
         {"type": DECISION_CLASSIFIER, "model": decision} if decision
         else {"type": "llm", "model": runner_up}
