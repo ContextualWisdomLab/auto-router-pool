@@ -395,7 +395,10 @@ def routers(
         maps = {
             name: grow(
                 tier_map, ladders, per_tier, band, windows, profiles[name], allow,
-                free_models,
+                # The classification group keeps its order: a free model is a
+                # cost win for routed work, but the classifier needs stable,
+                # predictable labels, not the cheapest model that answers.
+                () if name == "auto-classify" else free_models,
             )
             for name, tier_map in maps.items()
         }

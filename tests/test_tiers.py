@@ -90,6 +90,26 @@ class RoutersTest(unittest.TestCase):
             self.assertEqual(settings["classification_mode"], "every_request", name)
             self.assertFalse(settings["session_affinity"], name)
 
+    def test_free_models_do_not_reorder_the_classification_group(self):
+        # Classification is judged on label stability, not price, so a free
+        # deployment must not lead its model group there.
+        ladders = {
+            "primary": {"high": {"index": 55.0, "in": 3, "out": 15}},
+            "runner": {"high": {"index": 50.0, "in": 3, "out": 15}},
+            "free": {"high": {"index": 52.0, "in": 3, "out": 15}},
+        }
+        plain = tiers.routers(
+            "primary", "premium", "budget", "runner", ("micro",), ladders=ladders
+        )
+        boosted = tiers.routers(
+            "primary", "premium", "budget", "runner", ("micro",),
+            ladders=ladders, free_models={"free"},
+        )
+        self.assertEqual(plain["auto-classify"], boosted["auto-classify"])
+        self.assertTrue(
+            any(chain and chain[0][0] == "free" for chain in boosted["auto"].values())
+        )
+
     def test_focus_routers_use_the_shipped_tiers(self):
         for name in ("auto-classify", "auto-strix", "auto-advisor"):
             self.assertEqual(tuple(self.routers[name]), tiers.SHIPPED, name)
