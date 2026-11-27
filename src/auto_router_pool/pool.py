@@ -140,15 +140,22 @@ DECISION_WORDS = ("decision model",)
 
 
 def is_decision(row: dict) -> bool:
-    """The registration says this model decides rather than chats."""
+    """The registration says this model decides rather than chats.
+
+    A chat model can also expose a decisions endpoint (``gpt-6-luna`` lists
+    ``/v1/chat/completions`` and ``/v1/decisions``), so an endpoint alone proves
+    nothing: the decision endpoints have to be the model's whole surface.
+    """
     info = row.get("model_info") or {}
     if str(info.get("mode") or "").lower() in DECISION_MODES:
         return True
-    endpoints = " ".join(str(e).lower() for e in (info.get("supported_endpoints") or []))
-    if any(marker in endpoints for marker in DECISION_ENDPOINTS):
+    endpoints = [str(e).lower() for e in (info.get("supported_endpoints") or [])]
+    if any(marker in " ".join(endpoints) for marker in DECISION_ENDPOINTS) and not any(
+        "chat/completions" in endpoint for endpoint in endpoints
+    ):
         return True
     text = f"{info.get('description') or ''} {info.get('availability') or ''}".lower()
-    return any(word in text for word in DECISION_WORDS)
+    return any(word in text for word in DECISION_WORDS) and "not a chat" in text
 
 
 def decision_models(rows: list[dict]) -> list[str]:

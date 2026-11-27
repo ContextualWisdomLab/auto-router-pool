@@ -187,9 +187,16 @@ class DecisionModelTest(unittest.TestCase):
         self.assertEqual(pool.decision_models(rows), ["clef"])
 
     def test_a_described_decision_model_is_recognised(self):
-        rows = [self.row("clef-flash", {"mode": "chat",
-                                         "description": "a 9B decision model, not chat"})]
+        rows = [self.row("clef-flash", {"mode": "chat", "description":
+                          "a 9B decision model returning probabilities; not a chat model"})]
         self.assertEqual(pool.decision_models(rows), ["clef-flash"])
+
+    def test_a_chat_model_with_a_decisions_endpoint_is_not_a_decision_model(self):
+        # gpt-6-luna lists /v1/chat/completions and /v1/decisions: it is a chat
+        # model that can also decide, not a decision-only endpoint.
+        rows = [self.row("luna", {"mode": "chat", "supported_endpoints": [
+            "/v1/chat/completions", "/v1/batch", "/v1/decisions"]})]
+        self.assertEqual(pool.decision_models(rows), [])
 
     def test_a_plain_chat_model_is_not_a_decision_model(self):
         rows = [self.row("gpt", {"mode": "chat", "description": "general chat model"})]
