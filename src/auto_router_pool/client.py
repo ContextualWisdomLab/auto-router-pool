@@ -99,6 +99,34 @@ def deployment_health(client: Client, model_id: str, timeout: float = 25) -> str
     return "unknown"
 
 
+DECISION_PATHS = ("/v1/decisions", "/v1/systemone")
+
+
+def probe_decision(client: Client, model: str):
+    """Whether a decision endpoint serves this model.
+
+    A decision model answers a schema, not a chat turn, and the schema differs
+    per vendor, so a shape error (400/422) still proves the route exists -- that
+    is exactly the proof a chat probe cannot give. An auth or alias error means
+    the registration itself is wrong and must not be kept.
+    """
+    last = "no_decision_route"
+    for path in DECISION_PATHS:
+        result = client.post(
+            path, {"model": model}, timeout=PROBE_TIMEOUT
+        )
+        status = result.get("error_status")
+        if status is None:
+            return True, "ok"
+        if status in (400, 422):
+            return True, f"schema_{status}"
+        last = f"unavailable_{status}"
+        if status in (401, 403, 404):
+            continue
+        return False, last
+    return False, last
+
+
 def models(client: Client) -> list[dict]:
     payload = client.get("/model/info")
     return payload.get("data", [])

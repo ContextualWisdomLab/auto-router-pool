@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 
 from .client import probe as chat_probe
+from .client import probe_decision
+from .pool import DECISION_MODES
 
 REQUIRED = ("model_name", "litellm_params")
 
@@ -47,7 +49,8 @@ def registered(rows: list[dict], name: str) -> bool:
     return any(row["model_name"] == name for row in rows)
 
 
-def ensure_guests(client, guests: list[dict], rows: list[dict], probe=chat_probe):
+def ensure_guests(client, guests: list[dict], rows: list[dict], probe=chat_probe,
+                  decision_probe=probe_decision):
     """Register every missing guest, keeping only the ones that answer.
 
     Returns one record per guest: ``present`` when the catalogue already had it,
@@ -70,14 +73,18 @@ def ensure_guests(client, guests: list[dict], rows: list[dict], probe=chat_probe
             )
             continue
 
-        # A decision endpoint answers a schema, not a chat turn, so a chat probe
-        # would prove nothing there.
+        # A decision model is registered by its endpoint, whatever it is called:
+        # the name proves nothing, so the route itself is what gets probed.
         mode = str((guest.get("model_info") or {}).get("mode") or "chat").lower()
-        if mode != "chat":
-            results.append({"model": name, "action": "registered", "detail": mode})
+        if mode in DECISION_MODES:
+            ok, reason = decision_probe(client, name)
+        elif mode != "chat":
+            results.append(
+                {"model": name, "action": "registered", "detail": f"no {mode} probe"}
+            )
             continue
-
-        ok, reason = probe(client, name)
+        else:
+            ok, reason = probe(client, name)
         if ok:
             results.append({"model": name, "action": "registered"})
             continue

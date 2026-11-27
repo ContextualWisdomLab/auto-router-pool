@@ -190,8 +190,27 @@ router, a decision endpoint, a preview alias. They are declared in
 
 A guest registers once and is then left alone. One that registers but cannot
 answer a one-token probe is deleted again, so a stale declaration never leaves a
-dead model group behind; a decision-class guest skips the chat probe because it
-answers a schema instead of a conversation.
+dead model group behind. A **decision** guest (`"mode": "decision"`) is probed on
+its decision endpoint instead: a chat probe cannot reach it, and a shape error
+(400/422) is proof the route exists while an auth or alias error (401/403/404)
+is proof the registration is wrong. The name is the operator's choice — what
+identifies a decision model is the endpoint it exposes, not what it is called.
+
+```json
+{"model_name": "my-decision",
+ "litellm_params": {"model": "openai/some-alias", "api_base": "https://…/v1",
+                    "litellm_credential_name": "shared"},
+ "model_info": {"mode": "decision"}}
+```
+
+### Live fallbacks
+
+`--live-fallbacks --apply` runs the fallback sanitizer in this package
+(`live.py`): dead targets are stripped from every chain and the graph ends on a
+live model, with `--prices` and `--seed-file` as its inputs. It is a separate
+run from tier planning because the two write different things (router settings
+vs. router tiers), and keeping them apart means one failing never half-applies
+the other.
 
 A **decision model** is a different kind of endpoint, not a cheaper chat model: it
 takes a state plus a schema of typed questions and returns calibrated

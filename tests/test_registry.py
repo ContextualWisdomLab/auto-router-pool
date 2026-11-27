@@ -13,10 +13,11 @@ GUEST = {
 
 
 class FakeClient:
-    def __init__(self, create=None, answers=True):
+    def __init__(self, create=None, answers=True, decision=None):
         self.calls = []
         self.create = create or {"model_id": "mid-1"}
         self.answers = answers
+        self.decision = decision or {"error_status": 400}
 
     def post(self, path, body, timeout=None):
         self.calls.append((path, body))
@@ -26,6 +27,8 @@ class FakeClient:
             return {"success": True}
         if path == "/v1/chat/completions":
             return {"model": body["model"]} if self.answers else {"error_status": 401}
+        if path in ("/v1/decisions", "/v1/systemone"):
+            return self.decision
         return {}
 
     def paths(self):
@@ -73,13 +76,20 @@ class EnsureTest(unittest.TestCase):
                          [{"model": "guest", "action": "present"}])
         self.assertEqual(client.calls, [])
 
-    def test_a_decision_guest_is_not_chat_probed(self):
+    def test_a_decision_guest_is_probed_on_its_endpoint_not_chat(self):
         guest = dict(GUEST, model_info={"mode": "decision"})
-        client = FakeClient()
+        client = FakeClient(decision={"error_status": 400})
         results = registry.ensure_guests(client, [guest], [])
-        self.assertEqual(results, [{"model": "guest", "action": "registered",
-                                    "detail": "decision"}])
+        self.assertEqual(results, [{"model": "guest", "action": "registered"}])
+        self.assertIn("/v1/decisions", client.paths())
         self.assertNotIn("/v1/chat/completions", client.paths())
+
+    def test_a_decision_guest_whose_alias_is_wrong_is_deleted(self):
+        guest = dict(GUEST, model_info={"mode": "decision"})
+        client = FakeClient(decision={"error_status": 403})
+        results = registry.ensure_guests(client, [guest], [])
+        self.assertEqual(results[0]["action"], "reverted")
+        self.assertEqual(client.paths()[-1], "/model/delete")
 
     def test_a_refused_registration_is_reported_not_retried(self):
         client = FakeClient(create={"error_status": 400})

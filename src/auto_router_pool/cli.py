@@ -297,6 +297,18 @@ def parse_args(argv=None):
         "--guests", type=Path, default=None,
         help="guest declarations (default: <home>/auto-pool-guests.json)",
     )
+    parser.add_argument(
+        "--live-fallbacks", action="store_true",
+        help="keep every fallback chain ending on a live model (own run, no tier write)",
+    )
+    parser.add_argument(
+        "--prices", type=Path, default=None,
+        help="pinned LiteLLM price map for --live-fallbacks",
+    )
+    parser.add_argument(
+        "--seed-file", type=Path, default=None,
+        help='JSON {"group": "deployment-id"} to unblock for --live-fallbacks',
+    )
     parser.add_argument("--env-file", type=Path, default=None, help="file with KEY=VALUE secrets")
     parser.add_argument("--home", type=Path, default=None, help="state, cache and backup directory")
     parser.add_argument("--prefix", default="", help="only models whose id starts with this")
@@ -315,6 +327,22 @@ def run(args) -> int:
         settings.home = args.home
     if args.micro is not None:
         settings.micro = csv(args.micro)
+
+    if args.live_fallbacks:
+        # The fallback sanitizer ships in this package (``live.py``). Running it
+        # through this flag leaves the host nothing to schedule but one script,
+        # instead of a wrapper that re-declares the same paths and flags.
+        from .live import main as live_main
+
+        argv = ["--apply"] if args.apply else []
+        if args.env_file:
+            argv += ["--env-file", str(args.env_file)]
+        argv += ["--base-url", settings.litellm_base]
+        if args.prices:
+            argv += ["--prices", str(args.prices)]
+        if args.seed_file:
+            argv += ["--seed-file", str(args.seed_file)]
+        return live_main(argv)
     missing = required_env(settings)
     if missing:
         print(json.dumps({"error": "missing environment", "names": missing}))
