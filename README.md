@@ -29,10 +29,15 @@ the same model at `max`.
    `:batch` route or a `/v1/batches` endpoint) is registered with
    `model_info.mode: batch`, and the `:batch` price-map suffix is stripped from
    the model id because the provider's batch API takes the normal slug. A model
-   that advertises chat as well as batches stays a chat model. The run reports
+   that advertises chat as well as batches stays a chat model. An older
+   deployment already registered as `chat` is still treated as batch when its
+   group, display name or upstream carries a batch marker, so it is never probed
+   or routed as chat. The run reports
    how many batch entries the catalogue advertises, how many this account can
-   actually call, and how many `:batch` prices exist; only an authenticated entry
-   is registered. This stage never writes block flags:
+   actually call, and how many `:batch` prices exist. Batch variants are not chat
+   models, so they are registered from the public catalogue even when
+   `/v1/models` omits them; a group already stored as `chat` is updated in place
+   to `mode: batch`. This stage never writes block flags:
    `--quarantine` owns those, because a probe can prove a deployment dead but an
    account's exhausted credit is not provable from one deployment.
 2. **Filter to valid models**: a declared input window of at least 272,000
@@ -119,6 +124,7 @@ a host schedules one entry point instead of a directory of scripts:
 | flag | what it does |
 |---|---|
 | `--sync-catalog` | register missing Experiential models (inside the pool run) |
+| `--sync-batch` | register public batch models as `mode: batch` |
 | `--sync-catalogs` | Cursor Cloud snapshot, Cursor chat bases, Anthropic official models, CLIProxyAPI `gemini-4-argon` |
 | `--maintenance` | add `prompt_cache_key` to the drop list of providers that refuse it |
 | `--repair-cooldowns` | cap pooled bridge cooldowns at 30s and clear one only after two real answers |

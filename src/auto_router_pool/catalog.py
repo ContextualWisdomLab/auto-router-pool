@@ -118,6 +118,20 @@ def route(entry: dict) -> dict | None:
     return routes[0] if routes else None
 
 
+def batch_route(entry: dict) -> dict | None:
+    """A provider route for a batch entry, even though it is not chat-routable.
+
+    The catalogue marks batch providers ``routable: null`` because they cannot
+    answer a synchronous chat request. That is precisely why the batch model
+    still needs a registration of its own.
+    """
+    routes = [
+        item for item in (entry.get("providers") or [])
+        if isinstance(item, dict) and item.get("provider")
+    ]
+    return next((item for item in routes if item.get("routable")), routes[0] if routes else None)
+
+
 def decisions_endpoint(entry: dict) -> str | None:
     """Which decision API the catalogue says this model speaks, if any.
 
@@ -268,7 +282,8 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
                 continue
             entry = public[slug.removesuffix(":free")]
         model = entry.get("model") or {}
-        provider_route = route(entry)
+        batch = batch_endpoint(entry)
+        provider_route = batch_route(entry) if batch else route(entry)
         if not provider_route:
             continue
         if model.get("status") != "active":
@@ -288,7 +303,10 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
         ]
         if len(owned) > 1 or len(legacy) > 1:
             raise ValueError("ambiguous owned route for " + slug)
-        previous = (owned or legacy or [None])[0]
+        # A batch group that already exists as chat must be corrected in place:
+        # mode=chat would keep it out of the batch API, and creating a second
+        # group would leave the wrong registration behind.
+        previous = (owned or legacy or (same if batch else []) or [None])[0]
         if previous is None:
             order = max(
                 (
@@ -302,7 +320,6 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
 
         publisher, transport = resolve_publisher(slug, model, provider_route, prices)
         endpoint = decisions_endpoint(entry)
-        batch = batch_endpoint(entry)
         if batch:
             # A batch variant is often named after the group (``gpt-5.4-batch``)
             # while the provider route carries the model the batch actually
@@ -312,6 +329,14 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
             # A batch price-map key often carries ``:batch``; the provider's
             # batch API takes the normal slug, so it is not part of the model id.
             provider_id = provider_id.removesuffix(":batch")
+            # Some routes already carry a vendor prefix (``anthropic/...``);
+            # prepending the transport would double it. OpenRouter exposes
+            # ``anthropic/claude-x`` even when the transport is anthropic.
+            provider = str(provider_route.get("provider") or "")
+            for prefix in (transport, provider):
+                if prefix and provider_id.startswith(prefix + "/"):
+                    provider_id = provider_id[len(prefix) + 1:]
+                    break
             params = {
                 "model": transport + "/" + (provider_id or slug),
                 "custom_llm_provider": transport,
@@ -359,7 +384,7 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
                 str(model.get("description") or model.get("display_name") or slug)
                 + " (Publisher: " + publisher + ")"
             ),
-            "availability": "authenticated Experiential Labs catalog",
+            "availability": "Experiential Labs catalog",
         }
         if (
             free
@@ -426,14 +451,58 @@ def batch_catalog(auth_ids, public: dict, prices: dict | None = None) -> dict:
         if batch_endpoint(entry)
     }
     authenticated = sorted(found & auth)
+    registrable = {
+        slug for slug in found
+        if batch_route(public[slug]) is not None
+    }
     return {
         "found": len(found),
         "authenticated": len(authenticated),
+        "registrable": len(registrable),
         "models": authenticated,
         "price_map": sum(
             1 for key in (prices or {}) if str(key).lower().endswith(":batch")
         ),
     }
+
+
+def sync_batch(client, rows: list[dict], home: Path, *, prices: dict | None = None,
+               key: str | None = None, api: str = API, apply: bool = False) -> dict:
+    """Register public batch models without requiring chat authentication.
+
+    ``/v1/models`` lists chat models; a batch-only variant is often absent even
+    when its batch endpoint and price exist. Only batch entries with a provider
+    route are planned, and every one is written as ``mode: batch``.
+    """
+    key = key or load_key(home)
+    if not key:
+        return {"source": "experientiallabs", "skipped": "no_credential"}
+    try:
+        _, public = fetch(api, key)
+        batch_ids = {
+            slug for slug, entry in public.items() if batch_endpoint(entry)
+        }
+        planned = plan(batch_ids, public, rows, prices)
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        return {"source": "experientiallabs", "error": str(error)[:200]}
+
+    changes = [(action, body) for action, body in planned if action != "unchanged"]
+    summary = {
+        "source": "experientiallabs",
+        "batch": len(batch_ids),
+        "eligible": len(planned),
+        "create": sum(action == "create" for action, _ in planned),
+        "update": sum(action == "update" for action, _ in planned),
+        "unchanged": sum(action == "unchanged" for action, _ in planned),
+    }
+    if apply:
+        summary["actions"] = apply_plan(client, changes)
+    else:
+        summary["actions"] = [
+            {"model": body["model_name"], "action": action}
+            for action, body in changes
+        ]
+    return summary
 
 
 def sync(client, rows: list[dict], home: Path, *, prices: dict | None = None,
@@ -452,7 +521,10 @@ def sync(client, rows: list[dict], home: Path, *, prices: dict | None = None,
         retired = json.loads(retired_path.read_text()) if retired_path.exists() else []
         if not isinstance(retired, list):
             raise ValueError("retired model list is invalid")
-        planned = plan(auth_ids, public, rows, prices, retired)
+        batch_ids = {
+            slug for slug, entry in public.items() if batch_endpoint(entry)
+        }
+        planned = plan(set(auth_ids) | batch_ids, public, rows, prices, retired)
     except (OSError, ValueError, urllib.error.URLError) as error:
         return {"source": "experientiallabs", "error": str(error)[:200]}
 

@@ -38,6 +38,7 @@ from .client import (
 )
 from .apply import DECISION_CLASSIFIER
 from .catalog import sync as sync_catalog
+from .catalog import sync_batch
 from .extra_catalogs import sync_all as sync_provider_catalogs
 from .maintenance import health_report, prompt_cache_drop_pass, repair_cooldowns
 from .modality_benchmarks import load as load_modality_benchmarks
@@ -302,6 +303,10 @@ def parse_args(argv=None):
         help="sync the Cursor, Anthropic and CLIProxy catalogues and exit",
     )
     parser.add_argument(
+        "--sync-batch", action="store_true",
+        help="register public batch models as mode=batch and exit",
+    )
+    parser.add_argument(
         "--maintenance", action="store_true",
         help="apply missing prompt_cache_key drops and exit",
     )
@@ -374,7 +379,8 @@ def run(args) -> int:
 
     # The provider-specific syncs and upkeep jobs keep their own cadence but no
     # longer need a script of their own: one cron entry now calls this program.
-    if args.sync_catalogs or args.maintenance or args.repair_cooldowns or args.health_report:
+    if (args.sync_catalogs or args.sync_batch or args.maintenance
+            or args.repair_cooldowns or args.health_report):
         rows = models(litellm)
         catalog_path = args.prices or (settings.home / "litellm-model-prices-main.json")
         prices = {}
@@ -387,6 +393,10 @@ def run(args) -> int:
         if args.sync_catalogs:
             output["catalogs"] = sync_provider_catalogs(
                 litellm, settings.home, rows, prices, apply=args.apply
+            )
+        if args.sync_batch:
+            output["batch_sync"] = sync_batch(
+                litellm, rows, settings.home, prices=prices, apply=args.apply
             )
         if args.maintenance:
             output["prompt_cache_drop"] = prompt_cache_drop_pass(

@@ -76,6 +76,16 @@ class EnsureTest(unittest.TestCase):
                          [{"model": "guest", "action": "present"}])
         self.assertEqual(client.calls, [])
 
+    def test_a_batch_guest_is_not_chat_probed(self):
+        guest = dict(GUEST, model_name="gpt-5.4-batch")
+        client = FakeClient(answers=False)
+        results = registry.ensure_guests(client, [guest], [])
+        self.assertEqual(results, [{
+            "model": "gpt-5.4-batch", "action": "registered",
+            "detail": "no batch probe",
+        }])
+        self.assertEqual(client.paths(), ["/model/new"])
+
     def test_a_decision_guest_is_probed_on_its_endpoint_not_chat(self):
         guest = dict(GUEST, model_info={"mode": "decision"})
         client = FakeClient(decision={"error_status": 400})

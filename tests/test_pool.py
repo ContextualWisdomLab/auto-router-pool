@@ -448,6 +448,15 @@ class SpecializedTest(unittest.TestCase):
         self.assertEqual(pool.group_state(rows, "batch"), (False, "batch_model"))
         self.assertEqual(pool.batch_models(rows), ["batch"])
 
+    def test_a_batch_name_wins_over_a_stale_chat_mode(self):
+        rows = [{"model_name": "gpt-5.4-batch", "litellm_params": {
+            "model": "openai/gpt-5.4",
+        }, "model_info": {"mode": "chat", "max_input_tokens": 400000}}]
+        self.assertEqual(
+            pool.group_state(rows, "gpt-5.4-batch"), (False, "batch_model")
+        )
+        self.assertEqual(pool.batch_models(rows), ["gpt-5.4-batch"])
+
 
 class DecisionCatalogTest(unittest.TestCase):
     CATALOG = {

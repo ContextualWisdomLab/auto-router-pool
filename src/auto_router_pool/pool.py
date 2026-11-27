@@ -52,13 +52,37 @@ def input_window(rows: list[dict], name: str) -> int:
     return max(known) if known else 0
 
 
+def is_batch(row: dict) -> bool:
+    """The deployment is a batch model, however it was registered.
+
+    ``mode: batch`` is LiteLLM's marker, but an older registration or a guest
+    may still say ``chat``. A ``-batch`` name, ``(batch)`` label or ``:batch``
+    upstream is then the signal; treating it as chat would probe and route a
+    model that only answers the batch API. A model that merely advertises
+    ``/v1/batch`` alongside chat is still a chat model.
+    """
+    info = row.get("model_info") or {}
+    if str(info.get("mode") or "").lower() == "batch":
+        return True
+    labels = (
+        str(row.get("model_name") or "").lower(),
+        str(info.get("display_name") or "").lower(),
+        str((row.get("litellm_params") or {}).get("model") or "").lower(),
+    )
+    return any(
+        label.endswith("-batch")
+        or label.endswith(":batch")
+        or "(batch)" in label
+        for label in labels
+    )
+
+
 def group_state(rows: list[dict], name: str, minimum: int = MIN_INPUT_TOKENS):
     """``(usable, reason)`` based on registration, blocked flags and context."""
     group = [row for row in rows if row["model_name"] == name]
     if not group:
         return False, "unregistered"
-    mode = str((group[0].get("model_info") or {}).get("mode") or "").lower()
-    if mode == "batch":
+    if any(is_batch(row) for row in group):
         return False, "batch_model"
     if all((row.get("model_info") or {}).get("blocked") for row in group):
         return False, "all_blocked"
@@ -337,10 +361,7 @@ def batch_models(rows: list[dict]) -> list[str]:
     """Registered groups that serve the batch API rather than a chat turn."""
     return sorted(
         name for name in {row["model_name"] for row in rows}
-        if any(
-            str((row.get("model_info") or {}).get("mode") or "").lower() == "batch"
-            for row in rows if row["model_name"] == name
-        )
+        if any(is_batch(row) for row in rows if row["model_name"] == name)
     )
 
 

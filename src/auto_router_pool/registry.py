@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .client import probe as chat_probe
 from .client import probe_decision
-from .pool import DECISION_MODES
+from .pool import DECISION_MODES, is_batch
 
 REQUIRED = ("model_name", "litellm_params")
 
@@ -78,6 +78,11 @@ def ensure_guests(client, guests: list[dict], rows: list[dict], probe=chat_probe
         mode = str((guest.get("model_info") or {}).get("mode") or "chat").lower()
         if mode in DECISION_MODES:
             ok, reason = decision_probe(client, name)
+        elif is_batch(guest):
+            results.append(
+                {"model": name, "action": "registered", "detail": "no batch probe"}
+            )
+            continue
         elif mode != "chat":
             results.append(
                 {"model": name, "action": "registered", "detail": f"no {mode} probe"}

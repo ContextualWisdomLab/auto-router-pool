@@ -223,6 +223,47 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(body["model_info"]["mode"], "chat")
         self.assertNotIn("supported_endpoints", body["model_info"])
 
+    def test_a_provider_prefixed_batch_route_is_not_doubled(self):
+        batch = entry("claude-opus-5-batch", maker="Anthropic",
+                      routes=(("anthropic", None),))
+        batch["providers"][0]["provider_model_id"] = "anthropic/claude-opus-5"
+        _, body = by_name(
+            catalog.plan({"claude-opus-5-batch"}, {"claude-opus-5-batch": batch}, []),
+            "claude-opus-5-batch",
+        )
+        self.assertEqual(body["litellm_params"]["model"], "anthropic/claude-opus-5")
+
+    def test_a_public_batch_model_is_registered_without_chat_authentication(self):
+        batch = entry("gpt-5.4-batch", routes=(("openai", None),))
+        planned = catalog.plan({"gpt-5.4-batch"}, {"gpt-5.4-batch": batch}, [])
+        action, body = by_name(planned, "gpt-5.4-batch")
+        self.assertEqual(action, "create")
+        self.assertEqual(body["model_info"]["mode"], "batch")
+
+    def test_a_stale_chat_batch_registration_is_corrected_in_place(self):
+        batch = entry("gpt-5.4-batch", routes=(("openai", None),))
+        rows = [{
+            "model_name": "gpt-5.4-batch",
+            "litellm_params": {"model": "openai/gpt-5.4-batch", "order": 1},
+            "model_info": {"id": "old-id", "mode": "chat"},
+        }]
+        action, body = by_name(
+            catalog.plan({"gpt-5.4-batch"}, {"gpt-5.4-batch": batch}, rows),
+            "gpt-5.4-batch",
+        )
+        self.assertEqual(action, "update")
+        self.assertEqual(body["model_info"]["id"], "old-id")
+        self.assertEqual(body["model_info"]["mode"], "batch")
+
+    def test_sync_batch_plans_public_entries_without_auth(self):
+        batch = entry("gpt-5.4-batch", routes=(("openai", None),))
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.object(catalog, "fetch", return_value=(set(), {"gpt-5.4-batch": batch})):
+            result = catalog.sync_batch(None, [], Path(home), key="k")
+        self.assertEqual(result["batch"], 1)
+        self.assertEqual(result["create"], 1)
+        self.assertEqual(result["actions"], [{"model": "gpt-5.4-batch", "action": "create"}])
+
     def test_batch_catalog_separates_authenticated_from_advertised(self):
         public = {
             "reachable-batch": entry("reachable-batch"),
@@ -235,6 +276,7 @@ class BatchTest(unittest.TestCase):
         )
         self.assertEqual(summary["found"], 2)
         self.assertEqual(summary["authenticated"], 1)
+        self.assertEqual(summary["registrable"], 2)
         self.assertEqual(summary["models"], ["reachable-batch"])
         self.assertEqual(summary["price_map"], 1)
 
