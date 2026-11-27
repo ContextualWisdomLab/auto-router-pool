@@ -74,10 +74,71 @@ class FrontierTest(unittest.TestCase):
         frontier = routers["auto"]["최고난도 추론·심층 연구·복잡한 장기 작업"]
         self.assertEqual(frontier, [("astra", "medium"), ("sol", "high"), ("old", "max")])
 
+    def test_routers_pad_every_tier_when_ladders_are_known(self):
+        routers = tiers.routers(
+            "sol", "astra", "budget", "old", (), {},
+            ladders={"astra": ASTRA, "sol": SOL, "old": OLD_SOL, "budget": ladder(max=18.5)},
+        )
+        for tier_map in routers.values():
+            for tier, entries in tier_map.items():
+                # Width is bounded by the roster, never by a configured number.
+                self.assertLessEqual(len(entries), 4, tier)
+                names = [model for model, _ in entries]
+                self.assertEqual(len(names), len(set(names)), tier)
+        visual = routers["auto"]["시각 자료 해석·화면 조작·글쓰기"]
+        self.assertEqual(len(visual), 3)
+
     def test_frontier_keeps_peak_efforts_without_ladders(self):
         routers = tiers.routers("sol", "astra", "budget", "old", (), {"astra": "max"})
         frontier = routers["auto"]["최고난도 추론·심층 연구·복잡한 장기 작업"]
         self.assertEqual(frontier, [("astra", "max"), ("sol", "xhigh"), ("old", "xhigh")])
+
+
+class GrowTest(unittest.TestCase):
+    def test_pads_a_tier_with_same_score_fallbacks(self):
+        tier_map = {"frontier": [("old", "max")]}
+        grown = assign.grow(
+            tier_map, {"astra": ASTRA, "sol": SOL, "old": OLD_SOL}, limit=4
+        )
+        # Equal price, so the higher measured index comes first.
+        self.assertEqual(
+            grown["frontier"],
+            [("old", "max"), ("astra", "medium"), ("sol", "high")],
+        )
+
+    def test_tier_width_comes_from_the_roster(self):
+        # Every model whose ladder reaches the tier score inside the band joins,
+        # so the size is a result of the constraints rather than a parameter.
+        ladders = {"astra": ASTRA, "sol": SOL, "old": OLD_SOL, "anchor": ladder(max=55.0)}
+        grown = assign.grow({"frontier": [("old", "max")]}, ladders)
+        self.assertEqual(
+            [model for model, _ in grown["frontier"]],
+            ["old", "astra", "anchor", "sol"],
+        )
+
+    def test_models_below_the_tier_score_are_not_added(self):
+        tier_map = {"frontier": [("astra", "max")]}
+        grown = assign.grow(
+            tier_map, {"astra": ASTRA, "sol": SOL, "old": OLD_SOL}, limit=4
+        )
+        self.assertEqual(grown["frontier"], [("astra", "max")])
+
+    def test_limit_is_never_exceeded(self):
+        tier_map = {"tier": [("old", "max")]}
+        grown = assign.grow(
+            tier_map, {"astra": ASTRA, "sol": SOL, "old": OLD_SOL}, limit=2
+        )
+        self.assertEqual(grown["tier"], [("old", "max"), ("astra", "medium")])
+
+    def test_padding_cannot_shrink_the_window(self):
+        tier_map = {"tier": [("old", "max")]}
+        grown = assign.grow(
+            tier_map,
+            {"astra": ASTRA, "sol": SOL, "old": OLD_SOL},
+            limit=4,
+            windows={"old": 400000, "sol": 272000, "astra": 1000000},
+        )
+        self.assertEqual([model for model, _ in grown["tier"]], ["old", "astra"])
 
 
 class ScheduleTest(unittest.TestCase):

@@ -8,9 +8,11 @@ targets the weakest ceiling in the chain instead of each model's own peak.
 """
 from __future__ import annotations
 
-from .assign import SPREAD, place
+from .assign import SPREAD, grow, place
 
 ROUTERS = ("auto", "auto-classify", "auto-strix")
+
+FRONTIER = "최고난도 추론·심층 연구·복잡한 장기 작업"
 
 # Tier names are Korean because they are the router's published contract; the
 # classifier prompt refers to them by name.
@@ -89,8 +91,7 @@ def auto_tiers(
             (primary, "high"), (premium, "high"), (runner_up, "high")],
         "고난도 과제·심화 검토": [
             (primary, "high"), (premium, "high"), (runner_up, "high")],
-        "최고난도 추론·심층 연구·복잡한 장기 작업": _frontier(
-            premium, primary, runner_up, top, ladders, band),
+        FRONTIER: _frontier(premium, primary, runner_up, top, ladders, band),
     })
 
 
@@ -124,20 +125,30 @@ def routers(
     top=None,
     ladders=None,
     band: float = SPREAD,
+    per_tier: int | None = None,
+    windows=None,
 ):
     """Map router name -> tier spec.
 
     ``top`` maps a model to its highest measured effort, used where a tier holds
     a single model. ``ladders`` maps a model to its full measured ladder so the
-    frontier tier can be placed for equal score instead.
+    frontier tier can be placed for equal score and every tier can be padded
+    with same-score fallbacks; ``windows`` keeps that padding from shrinking a
+    tier's declared input window.
     """
-    return {
+    maps = {
         "auto": auto_tiers(
             primary, premium, budget, runner_up, micro, top, ladders, band
         ),
         "auto-classify": classify_tiers(primary, premium, budget, runner_up, micro),
         "auto-strix": strix_tiers(primary, premium, budget, runner_up, micro, top),
     }
+    if ladders:
+        maps = {
+            name: grow(tier_map, ladders, per_tier, band, windows)
+            for name, tier_map in maps.items()
+        }
+    return maps
 
 
 def build(tier_map: dict) -> tuple[dict, dict]:

@@ -34,6 +34,8 @@ from __future__ import annotations
 SPREAD = 3.0
 
 
+
+
 def _rungs(variants: dict) -> list[dict]:
     """``[{effort, index, cost}]`` sorted by measured index."""
     rungs = []
@@ -111,6 +113,68 @@ def place(models, ladders: dict, band: float = SPREAD) -> dict:
         "skipped": [model for model in rated if model not in placed],
         "unrated": unrated,
     }
+
+
+def grow(
+    tier_map: dict,
+    ladders: dict,
+    limit: int | None = None,
+    band: float = SPREAD,
+    windows: dict | None = None,
+) -> dict:
+    """Tier sizes as the solution of the same program, not a chosen number.
+
+    Per tier the program is::
+
+        maximise  |S|                             how many interchangeable fallbacks
+        s.t.      index[m,e] in [target, target + band]   same score as the tier
+                  window[m] >= window[tier]                no context regression
+
+    The feasible set is monotone in ``|S|`` and every candidate is independent,
+    so the optimum is simply every model that satisfies both constraints -- the
+    roster decides how wide a tier gets. ``limit`` only exists for callers that
+    want a smaller chain. Existing entries keep their place and effort.
+    """
+    rungs = {
+        name: _rungs(variants or {}) for name, variants in (ladders or {}).items()
+    }
+    grown = {}
+    for tier, entries in tier_map.items():
+        kept = [(model, effort) for model, effort in entries if model]
+        if not rungs or (limit is not None and len(kept) >= limit):
+            grown[tier] = kept
+            continue
+
+        indexes, window = [], None
+        for model, effort in kept:
+            choices = rungs.get(model) or []
+            here = next((r for r in choices if r["effort"] == effort), None)
+            if here is None and choices:
+                here = choices[-1]
+            if here:
+                indexes.append(here["index"])
+            if windows and model in windows:
+                window = windows[model] if window is None else min(window, windows[model])
+        if not indexes:
+            grown[tier] = kept
+            continue
+
+        target = min(indexes)
+        have = {model for model, _ in kept}
+        extra = []
+        for name, choices in rungs.items():
+            if name in have:
+                continue
+            if window is not None and windows and windows.get(name, 0) < window:
+                continue
+            rung = _cheapest(choices, target, band)
+            if rung is None:
+                continue
+            extra.append((rung["cost"], -rung["index"], name, rung["effort"]))
+        extra.sort()
+        room = len(extra) if limit is None else min(limit - len(kept), len(extra))
+        grown[tier] = kept + [(name, effort) for _, _, name, effort in extra[:room]]
+    return grown
 
 
 def schedule(models, ladders: dict, band: float = SPREAD) -> list[dict]:

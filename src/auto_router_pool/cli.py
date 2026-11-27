@@ -36,6 +36,7 @@ from .pool import (
     fingerprint,
     flaky_deployments,
     group_state,
+    input_window,
     pick,
     pick_micro,
     pick_primary,
@@ -43,7 +44,7 @@ from .pool import (
     score_hashes,
     stable_deployments,
 )
-from .tiers import ROUTERS, routers, top_effort
+from .tiers import FRONTIER, ROUTERS, routers, top_effort
 
 
 def default_home() -> Path:
@@ -446,15 +447,12 @@ def run(args) -> int:
     tier_plan = schedule(
         [premium[0], primary[0], budget[0], runner_up], candidates
     )
-    changes = plan(
-        rows,
-        routers(
-            primary[0], premium[0], budget[0], runner_up, micro, top,
-            ladders=candidates,
-        ),
-        primary[0],
-        runner_up,
+    router_map = routers(
+        primary[0], premium[0], budget[0], runner_up, micro, top,
+        ladders=candidates,
+        windows={name: input_window(rows, name) for name in candidates},
     )
+    changes = plan(rows, router_map, primary[0], runner_up)
     summary = {
         "catalogue": source,
         "pool": {
@@ -471,7 +469,7 @@ def run(args) -> int:
         "frontier": {
             "target": None if frontier["target"] is None else round(frontier["target"], 2),
             "spread": round(frontier["spread"], 2),
-            "efforts": {model: effort for model, effort, _ in frontier["entries"]},
+            "efforts": dict(router_map["auto"][FRONTIER]),
         },
         "tier_plan": {
             "tiers": len(tier_plan),

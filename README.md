@@ -90,6 +90,12 @@ support, the score each tier assumes and the (model, effort) entries assigned to
 it. A repeated entry set is merged instead of given a second name, so the plan
 never publishes two tiers that hand out the same score.
 
+Each tier is then padded to four models (`assign.grow`): a candidate joins only
+when one of its rungs reaches the tier's weakest entry inside the same band, and
+only while it keeps the tier's declared input window intact. Fallbacks therefore
+add redundancy without lowering the tier's score or shrinking the context the
+router advertises.
+
 ## Flaky deployments
 
 A model can be registered more than once (one deployment per credential or
