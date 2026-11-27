@@ -117,27 +117,55 @@ class ContextFloorTest(unittest.TestCase):
 
 
 class FreeModelsTest(unittest.TestCase):
-    def rows(self, *specs):
-        return [{"model_name": name, "model_info": info} for name, info in specs]
+    def row(self, name, upstream, info=None):
+        return {
+            "model_name": name,
+            "litellm_params": {"model": upstream},
+            "model_info": info or {},
+        }
 
-    def test_only_zero_cost_deployments_are_free(self):
-        rows = self.rows(
-            ("free-model", {"input_cost_per_token": 0, "output_cost_per_token": 0}),
-            ("paid-model", {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05}),
-        )
+    def test_a_free_tier_is_recognised_by_its_upstream_id(self):
+        rows = [
+            self.row("free-model", "openrouter/google/gemma-4-31b-it:free"),
+            self.row("paid-model", "openai/gpt-6.2-sol"),
+        ]
         self.assertEqual(pool.free_models(rows), {"free-model"})
+
+    def test_a_free_tier_with_configured_costs_is_still_free(self):
+        # A free tier may still carry a price, so cost must not decide this.
+        rows = [self.row(
+            "free-model", "openrouter/x/y:free",
+            {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05},
+        )]
+        self.assertEqual(pool.free_models(rows), {"free-model"})
+
+    def test_an_unpriced_group_is_not_free(self):
+        # Costs left unset declare zero (or nothing); that is not a free model.
+        rows = [
+            self.row("zero", "openai/paid-model",
+                     {"input_cost_per_token": 0, "output_cost_per_token": 0}),
+            self.row("unset", "openai/other-model",
+                     {"input_cost_per_token": None, "output_cost_per_token": None}),
+            self.row("absent", "openai/third-model"),
+        ]
+        self.assertEqual(pool.free_models(rows), set())
 
     def test_one_paid_deployment_makes_the_group_paid(self):
         # The router may reach any deployment of the group, so a mixed group is
         # not free and must not jump the queue.
-        rows = self.rows(
-            ("mixed", {"input_cost_per_token": 0, "output_cost_per_token": 0}),
-            ("mixed", {"input_cost_per_token": 3e-06, "output_cost_per_token": 1e-05}),
-        )
+        rows = [
+            self.row("mixed", "openai/gpt-6-luna:free"),
+            self.row("mixed", "openai/devin/gpt-6-luna"),
+        ]
         self.assertEqual(pool.free_models(rows), set())
 
-    def test_an_unpriced_group_is_not_free(self):
-        self.assertEqual(pool.free_models(self.rows(("unknown", {}))), set())
+    def test_an_operator_tag_can_mark_a_group_free(self):
+        rows = [self.row("tagged", "openai/custom", {"tags": ["free"]})]
+        self.assertEqual(pool.free_models(rows), {"tagged"})
+        self.assertEqual(
+            pool.free_models([self.row("flagged", "openai/custom", {"is_free": True})]),
+            {"flagged"},
+        )
 
 
 class PickMicroTest(unittest.TestCase):

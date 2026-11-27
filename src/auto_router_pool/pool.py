@@ -95,26 +95,38 @@ def score(variants: dict, effort: str):
     return entry["index"], entry["index"] / blended, entry
 
 
-def free_models(rows: list[dict]) -> set[str]:
-    """Model groups that cost nothing, judged by registration metadata.
+def declares_free(row: dict) -> bool:
+    """The deployment says it is free, in words rather than in numbers.
 
-    A deployment that declares zero input *and* zero output cost is free, which
-    only the catalogue can say for certain: a model that merely looks cheap in a
-    scored comparison is not free. A group with any paid deployment is not free
-    either, because the router may reach that one.
+    OpenRouter free tiers carry a ``:free`` upstream suffix; an operator can also
+    tag a deployment ``is_free`` or ``free`` in ``model_info``.
+    """
+    info = row.get("model_info") or {}
+    upstream = str((row.get("litellm_params") or {}).get("model") or "").lower()
+    tags = {str(tag).lower() for tag in (info.get("tags") or [])}
+    return upstream.endswith(":free") or info.get("is_free") is True or "free" in tags
+
+
+def free_models(rows: list[dict]) -> set[str]:
+    """Model groups that cost nothing, judged by an explicit free marker.
+
+    Cost fields cannot answer this in either direction, which is why they are not
+    consulted: a registration that was never priced declares zero, and a free
+    tier may still carry a price. Only a marker counts, and a group qualifies
+    only when *every* deployment the router could reach carries it -- one paid
+    sibling makes the group paid, because the router may reach that one.
     """
     groups: dict[str, list[dict]] = {}
     for row in rows:
-        groups.setdefault(row["model_name"], []).append(row.get("model_info") or {})
+        groups.setdefault(row["model_name"], []).append(row)
 
     free = set()
     for name, deployments in groups.items():
-        live = [info for info in deployments if not info.get("blocked")] or deployments
-        if all(
-            info.get("input_cost_per_token") == 0
-            and info.get("output_cost_per_token") == 0
-            for info in live
-        ):
+        live = [
+            row for row in deployments
+            if not (row.get("model_info") or {}).get("blocked")
+        ] or deployments
+        if all(declares_free(row) for row in live):
             free.add(name)
     return free
 
