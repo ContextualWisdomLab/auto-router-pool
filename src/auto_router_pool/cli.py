@@ -557,6 +557,31 @@ def run(args) -> int:
     status: dict[str, str] = {}
     probe_failures: dict[str, str] = {}
     observed_usage: dict[str, dict] = {}
+
+    # A model can borrow another model's Artificial Analysis ladder and price
+    # when it has no page of its own. Corrections come from model_info.base_model
+    # (or aa_base_model / benchmark_base) on any deployment, or from
+    # <home>/auto-pool-base-models.json: {"gateway-model": "base-model"}.
+    base_models: dict[str, str] = {}
+    override_path = settings.home / "auto-pool-base-models.json"
+    if override_path.exists():
+        try:
+            loaded = json.loads(override_path.read_text())
+        except (OSError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            base_models.update(
+                {str(key): str(value) for key, value in loaded.items()}
+            )
+    for row in rows:
+        info = row.get("model_info") or {}
+        base = (
+            info.get("base_model")
+            or info.get("aa_base_model")
+            or info.get("benchmark_base")
+        )
+        if base:
+            base_models.setdefault(row["model_name"], str(base))
     candidates: dict[str, dict] = {}
     structural: list[str] = []
 
@@ -588,8 +613,10 @@ def run(args) -> int:
         if not ok:
             probe_failures[name] = reason
             continue
+        base = base_models.get(name, name)
+        aa_slug = base.removesuffix(":free").split("/")[-1].replace(".", "-")
         variants, error = aa.get_variants(
-            name.replace(".", "-"),
+            aa_slug,
             cache,
             base=settings.aa_base,
             ttl=settings.aa_ttl,
@@ -707,6 +734,7 @@ def run(args) -> int:
         benchmark, benchmark_errors = aa.get_decision_scores(
             capable, decision_cache,
             ttl=settings.aa_ttl, force=args.refresh_scores,
+            aliases=base_models,
         )
         decision_scores = {
             name: entry["score"] for name, entry in benchmark.items()
@@ -769,6 +797,8 @@ def run(args) -> int:
         },
         # Decision models answer a schema, not a chat turn: never tier members.
         "decision_models": decision_models(rows),
+        # Gateway models whose AA ladder/price was borrowed from a base model.
+        "base_models": base_models,
         # Batch models are registered for /v1/batches and never chat tiers.
         "batch_models": batch_models(rows),
         "guests": guest_results,

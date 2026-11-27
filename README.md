@@ -100,6 +100,14 @@ the same model at `max`.
    it is ordered by original input price. A model with neither a score nor a
    price source is ranked last rather than guessed.
 
+   A model that AA does not score can borrow another model's ladder and price
+   by setting `model_info.base_model` (or `aa_base_model` / `benchmark_base`) on
+   one of its deployments, or by writing
+   `<home>/auto-pool-base-models.json` as `{"gateway-model": "base-model"}`.
+   The `openai/` prefix on `litellm_params.model` is LiteLLM's provider
+   namespace for the OpenAI-compatible gateway route; it is not the model's
+   publisher and is ignored when matching prices or benchmarks.
+
    The *default* model -- the path a request takes when no tier is chosen -- has
    no `tier_model_configs` entry, so it answers at its own default effort rather
    than at the rung its best score was measured at. Candidates are ranked at

@@ -77,9 +77,17 @@ _DECISION_PRICE = re.compile(
 )
 
 
-def decision_slug(name: str) -> str:
-    """AA's Decision Index slug for a gateway model name."""
+def decision_slug(name: str, aliases: dict | None = None) -> str:
+    """AA's Decision Index slug for a gateway model name.
+
+    ``aliases`` maps a gateway model to the base model whose AA page should be
+    borrowed when the model has none of its own. The alias is applied before the
+    built-in ``DECISION_ALIASES`` table, so a correction can target any scored
+    base model rather than only the hardcoded ones.
+    """
     base = str(name).removesuffix(":free")
+    if aliases:
+        base = str(aliases.get(base, base)).removesuffix(":free")
     return DECISION_ALIASES.get(base, base)
 
 
@@ -119,6 +127,7 @@ def get_decision_scores(
     ttl: float = DEFAULT_TTL,
     force: bool = False,
     fetch=None,
+    aliases: dict | None = None,
 ) -> tuple[dict[str, dict], dict[str, str]]:
     """``({gateway name: entry}, {name: reason})`` from AA's Decision Index.
 
@@ -131,7 +140,7 @@ def get_decision_scores(
     errors: dict[str, str] = {}
     now = time.time()
     for name in dict.fromkeys(names):
-        slug = decision_slug(name)
+        slug = decision_slug(name, aliases)
         entry = cache.get(slug)
         entry_ttl = NEGATIVE_TTL if entry and entry.get("score") is None else ttl
         if not force and entry and now - entry.get("fetched", 0) < entry_ttl:
