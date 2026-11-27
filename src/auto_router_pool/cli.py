@@ -71,7 +71,7 @@ from .pool import (
     free_gaps,
     free_models,
 )
-from .quarantine import budget_sweep
+from .quarantine import budget_sweep, live_failure_sweep, spend_failure_stats
 from .quarantine import sweep as quarantine_sweep
 from .registry import ensure_guests, load_guests, registered
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
@@ -485,6 +485,7 @@ def run(args) -> int:
     # honest: a group that answers is unblocked, one that cannot is narrowed.
     budget_quarantine: list[dict] = []
     quarantine: list[dict] = []
+    live_failure_quarantine: list[dict] = []
     if args.quarantine:
         # Budget is per key: one budget-exceeded answer blocks every deployment
         # sharing that credential, even when a sibling key still answers.
@@ -521,6 +522,13 @@ def run(args) -> int:
             lambda name: probe(litellm, name), apply=args.apply,
         )
         if quarantine and args.apply:
+            rows = models(litellm)
+
+        live_failure_quarantine = live_failure_sweep(
+            litellm, rows, managed, spend_failure_stats(),
+            apply=args.apply,
+        )
+        if live_failure_quarantine and args.apply:
             rows = models(litellm)
 
     # LiteLLM's registrations are the routing truth: a model the proxy lists but
@@ -827,6 +835,7 @@ def run(args) -> int:
         "classifier": classifier,
         "quarantine": quarantine,
         "budget_quarantine": budget_quarantine,
+        "live_failure_quarantine": live_failure_quarantine,
         # Every group that could classify if it answered: a decision-only model,
         # or a chat model that also serves /v1/decisions.
         "classifier_candidates": classifier_candidates(
