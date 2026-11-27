@@ -102,6 +102,44 @@ def deployment_health(client: Client, model_id: str, timeout: float = 25) -> str
 DECISION_PATHS = ("/v1/decisions", "/v1/systemone")
 
 
+# The smallest well-formed choice question: one label has to come back, which is
+# the same shape the router asks the classifier for a tier.
+DECISION_CHOICE = {
+    "questions": [
+        {
+            "type": "choice",
+            "choice": {
+                "instructions": "Which routing tier fits this request?",
+                "choices": {
+                    "SIMPLE": "a single lookup or rewrite",
+                    "MEDIUM": "an ordinary implementation request",
+                    "COMPLEX": "multi-step work across several files",
+                },
+            },
+        }
+    ]
+}
+
+
+def probe_decision_choice(client: Client, model: str):
+    """Whether a deployment answers a real choice question.
+
+    A registration can claim ``/v1/decisions``, and a provider can accept the
+    route while the upstream model refuses the schema. Only a 200 proves the
+    classifier will work, so anything else keeps the LLM judge: swapping in a
+    classifier that cannot answer would break routing outright.
+    """
+    result = client.post(
+        "/v1/decisions",
+        {"model": model, "input": "write a for loop", **DECISION_CHOICE},
+        timeout=PROBE_TIMEOUT,
+    )
+    status = result.get("error_status")
+    if status is not None:
+        return False, f"unavailable_{status}"
+    return True, "ok"
+
+
 def probe_decision(client: Client, model: str):
     """Whether a decision endpoint serves this model.
 

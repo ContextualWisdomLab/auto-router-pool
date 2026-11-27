@@ -134,7 +134,7 @@ def free_models(rows: list[dict]) -> set[str]:
 # A decision model answers a schema of typed questions in one forward pass and
 # returns calibrated probabilities. It is not a chat or streaming model, so it
 # can never fill a routing tier however cheap it is.
-DECISION_MODES = {"decision", "evaluation"}
+DECISION_MODES = {"decision", "decisions", "evaluation"}
 DECISION_ENDPOINTS = ("/v1/decisions", "/decisions", "/v1/systemone", "/systemone")
 DECISION_WORDS = ("decision model",)
 
@@ -171,18 +171,102 @@ def decision_models(rows: list[dict]) -> list[str]:
     )
 
 
-def decision_classifier(rows: list[dict]) -> str | None:
-    """A decision model this gateway can actually use as its classifier.
+def catalog_entry(upstream: str, catalog: dict | None) -> dict | None:
+    """The external catalogue's row for a deployment's upstream model string.
 
-    The router asks one question — which tier — and a decision model answers that
-    directly, so classification costs one cheap forward pass instead of a chat
-    completion. The 272k solver floor does not apply: the classifier reads a
+    Registration metadata is written by whoever added the deployment, so an
+    optimistic ``/v1/decisions`` in it is a claim, not a fact. The catalogue is
+    the reference: it carries ``mode: evaluation`` for Jev and chat for the
+    OpenRouter router, and that difference is exactly what decides whether a
+    deployment can classify.
+    """
+    if not catalog or not upstream:
+        return None
+    for key in (upstream, upstream.removesuffix(":free")):
+        if key in catalog:
+            return catalog[key]
+    # A route may be registered under a provider prefix the catalogue spells
+    # differently (``openai/gpt-x`` vs ``gpt-x``): match on the model tail.
+    tail = upstream.removesuffix(":free").split("/")[-1]
+    for key, entry in catalog.items():
+        if key.split("/")[-1] == tail:
+            return entry
+    return None
+
+
+def supports_decisions(row: dict, catalog: dict | None = None) -> bool:
+    """The deployment can answer a decision request, chat or not.
+
+    ``is_decision`` answers a different question: whether the model is *only* a
+    decision model, which is what keeps one out of every tier. A chat model that
+    also exposes ``/v1/decisions`` (``gpt-6-luna``) is a perfectly good
+    classifier, so the capability has to be read separately from the exclusion.
+
+    When the external catalogue knows the upstream model, its verdict wins: a
+    ``chat`` entry is not decision-capable however many endpoints the
+    registration lists, and an ``evaluation``/``decision`` entry is.
+    """
+    info = row.get("model_info") or {}
+    entry = catalog_entry((row.get("litellm_params") or {}).get("model") or "", catalog)
+    if entry is not None:
+        if str(entry.get("mode") or "").lower() in DECISION_MODES:
+            return True
+        endpoints = [str(e).lower() for e in (entry.get("supported_endpoints") or [])]
+        return any(marker in " ".join(endpoints) for marker in DECISION_ENDPOINTS)
+    if str(info.get("mode") or "").lower() in DECISION_MODES:
+        return True
+    endpoints = [str(e).lower() for e in (info.get("supported_endpoints") or [])]
+    if any(marker in " ".join(endpoints) for marker in DECISION_ENDPOINTS):
+        return True
+    text = f"{info.get('description') or ''} {info.get('availability') or ''}".lower()
+    return any(word in text for word in DECISION_WORDS) and "not a chat" in text
+
+
+def classifier_candidates(rows: list[dict], catalog: dict | None = None) -> list[dict]:
+    """Every group that can answer a decision request, and whether it can now.
+
+    A decision model is reported as ``exclusive``; a chat model that also serves
+    ``/v1/decisions`` is reported too, because it can classify even though it
+    must never fill a tier.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row["model_name"], []).append(row)
+    only = set(decision_models(rows))
+    out = []
+    for name, group in sorted(groups.items()):
+        if not any(supports_decisions(row, catalog) for row in group):
+            continue
+        out.append({
+            "model": name,
+            "exclusive": name in only,
+            "usable": any(
+                not (row.get("model_info") or {}).get("blocked") for row in group
+            ),
+        })
+    return out
+
+
+def decision_classifier(rows: list[dict], catalog: dict | None = None) -> str | None:
+    """A model this gateway can actually use as its decision classifier.
+
+    The router asks one question -- which tier -- and a decision endpoint answers
+    that in one cheap forward pass instead of a chat completion. Models that are
+    only decisions come first; a chat model that also serves decisions is the
+    second choice. The 272k solver floor does not apply: the classifier reads a
     short prompt, not the request, so its window cannot bound what the router
     advertises.
     """
-    for name in decision_models(rows):
-        group = [row for row in rows if row["model_name"] == name]
-        if any(not (row.get("model_info") or {}).get("blocked") for row in group):
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row["model_name"], []).append(row)
+    only = set(decision_models(rows))
+    capable = [
+        name for name, group in groups.items()
+        if any(supports_decisions(row, catalog) for row in group)
+    ]
+    for name in sorted(capable, key=lambda name: (name not in only, name)):
+        if any(not (row.get("model_info") or {}).get("blocked") for row in groups[name]):
             return name
     return None
 

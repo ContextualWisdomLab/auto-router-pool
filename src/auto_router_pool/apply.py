@@ -101,7 +101,7 @@ def context_drift(rows: list[dict], names=()) -> list[str]:
     return drift
 
 
-def classifier_drift(rows: list[dict], names=()) -> list[str]:
+def classifier_drift(rows: list[dict], names=(), catalog: dict | None = None) -> list[str]:
     """Routers whose classifier is foreign to their own tiers or too impatient.
 
     A classifier pointing at a model the router no longer selects times out and
@@ -127,7 +127,7 @@ def classifier_drift(rows: list[dict], names=()) -> list[str]:
                 < CLASSIFIER_TIMEOUT_MS
                 # A usable decision model is the cheaper, more direct classifier,
                 # so staying on the chat judge is drift too.
-                or (decision_classifier(rows) not in (None, model))
+                or (decision_classifier(rows, catalog) not in (None, model))
             )
         if stale:
             drift.append(row["model_name"])

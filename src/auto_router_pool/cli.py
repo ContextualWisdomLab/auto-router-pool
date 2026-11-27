@@ -29,7 +29,13 @@ from .apply import (
     smoke,
     validate,
 )
-from .client import Client, deployment_health, models, probe
+from .client import (
+    Client,
+    deployment_health,
+    models,
+    probe,
+    probe_decision_choice,
+)
 from .apply import DECISION_CLASSIFIER
 from .pool import (
     MIN_INPUT_TOKENS,
@@ -42,6 +48,7 @@ from .pool import (
     pick_micro,
     score_hashes,
     stable_deployments,
+    classifier_candidates,
     decision_classifier,
     decision_models,
     free_gaps,
@@ -363,6 +370,16 @@ def run(args) -> int:
     litellm = Client(settings.litellm_base, settings.key)
     rows = models(litellm)
 
+    # Registration metadata is a claim; the external price catalogue is the
+    # reference for which upstream models can actually answer a decision request.
+    catalog_path = args.prices or (settings.home / "litellm-model-prices-main.json")
+    catalog = {}
+    try:
+        if catalog_path and Path(catalog_path).exists():
+            catalog = json.loads(Path(catalog_path).read_text())
+    except (OSError, ValueError):
+        catalog = {}
+
     # Guests are models the operator can use that no catalogue sync carries: a
     # free upstream router, a decision endpoint, a preview alias. They are
     # declared in a file and registered here, because a model the router does
@@ -411,7 +428,7 @@ def run(args) -> int:
         and not fallback_pending
         and state.get("fingerprint") == current_fp
         and not context_drift(rows, ROUTERS)
-        and not classifier_drift(rows, ROUTERS)
+        and not classifier_drift(rows, ROUTERS, catalog)
     ):
         # Cooldowns and recoveries never touch the catalogue, so a fingerprint
         # match alone would keep a model that can no longer answer. Re-plan only
@@ -554,7 +571,14 @@ def run(args) -> int:
     # A decision model answers "which tier" in one forward pass, so it is the
     # classifier whenever the gateway can actually call one; the LLM judge is the
     # fallback, not the default.
-    decision = decision_classifier(rows)
+    decision = decision_classifier(rows, catalog)
+    if decision:
+        # Metadata only says the model should answer; the router only works if it
+        # actually does, so the judge is kept until a real choice comes back.
+        ok, reason = probe_decision_choice(litellm, decision)
+        if not ok:
+            status[decision] = f"classifier_{reason}"
+            decision = None
     classifier = (
         {"type": DECISION_CLASSIFIER, "model": decision} if decision
         else {"type": "llm", "model": runner_up}
@@ -590,6 +614,9 @@ def run(args) -> int:
         "guests": guest_results,
         "default_model": {"model": default, **default_note},
         "classifier": classifier,
+        # Every group that could classify if it answered: a decision-only model,
+        # or a chat model that also serves /v1/decisions.
+        "classifier_candidates": classifier_candidates(rows, catalog),
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

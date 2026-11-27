@@ -331,3 +331,60 @@ class DecisionClassifierTest(unittest.TestCase):
         rows = [{"model_name": "luna", "litellm_params": {},
                  "model_info": {"mode": "chat", "blocked": False}}]
         self.assertIsNone(pool.decision_classifier(rows))
+
+
+class DecisionCapabilityTest(unittest.TestCase):
+    """Capability (can it answer a decision?) is not exclusivity (is it only a decider?)."""
+
+    def test_a_chat_model_that_serves_decisions_is_capable(self):
+        row = {"model_name": "luna", "litellm_params": {},
+               "model_info": {"mode": "chat", "blocked": False,
+                              "supported_endpoints": ["/v1/chat/completions", "/v1/decisions"]}}
+        self.assertTrue(pool.supports_decisions(row))
+        self.assertFalse(pool.is_decision(row))
+
+    def test_capability_is_used_for_the_classifier_even_when_not_exclusive(self):
+        rows = [{"model_name": "luna", "litellm_params": {},
+                 "model_info": {"mode": "chat", "blocked": False,
+                                "supported_endpoints": ["/v1/chat/completions", "/v1/decisions"]}}]
+        self.assertEqual(pool.decision_classifier(rows), "luna")
+
+    def test_a_decision_only_model_is_preferred_over_a_capable_chat_model(self):
+        rows = [
+            {"model_name": "luna", "litellm_params": {},
+             "model_info": {"mode": "chat", "blocked": False,
+                            "supported_endpoints": ["/v1/chat/completions", "/v1/decisions"]}},
+            {"model_name": "clef", "litellm_params": {},
+             "model_info": {"id": "c1", "mode": "decisions", "blocked": False}},
+        ]
+        self.assertEqual(pool.decision_classifier(rows), "clef")
+
+    def test_a_plain_chat_model_stays_ineligible(self):
+        row = {"model_name": "sol", "litellm_params": {},
+               "model_info": {"mode": "chat", "blocked": False,
+                              "supported_endpoints": ["/v1/chat/completions"]}}
+        self.assertFalse(pool.supports_decisions(row))
+
+
+class ClassifierCandidateTest(unittest.TestCase):
+    def rows(self):
+        return [
+            {"model_name": "clef", "litellm_params": {},
+             "model_info": {"id": "c", "mode": "decisions", "blocked": True}},
+            {"model_name": "luna", "litellm_params": {},
+             "model_info": {"mode": "chat", "blocked": False,
+                            "supported_endpoints": ["/v1/chat/completions", "/v1/decisions"]}},
+            {"model_name": "sol", "litellm_params": {},
+             "model_info": {"mode": "chat", "blocked": False,
+                            "supported_endpoints": ["/v1/chat/completions"]}},
+        ]
+
+    def test_candidates_report_capability_and_usability(self):
+        self.assertEqual(
+            pool.classifier_candidates(self.rows()),
+            [{"model": "clef", "exclusive": True, "usable": False},
+             {"model": "luna", "exclusive": False, "usable": True}],
+        )
+
+    def test_the_unblocked_capable_model_wins(self):
+        self.assertEqual(pool.decision_classifier(self.rows()), "luna")
