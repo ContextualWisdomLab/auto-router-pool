@@ -37,6 +37,7 @@ from .pool import (
     flaky_deployments,
     group_state,
     input_window,
+    pick_default,
     pick_micro,
     score_hashes,
     stable_deployments,
@@ -515,8 +516,13 @@ def run(args) -> int:
     )
     # The classifier contract travels with the tiers: LiteLLM rejects a tier map
     # that does not cover every defined tier, so both are written in one patch.
+    # The default path has no tier config, so it answers at the model's own
+    # default effort; rank by what each candidate can promise there.
+    default, default_note = pick_default(
+        rows, candidates, [primary[0], premium[0], runner_up]
+    )
     changes = plan(
-        rows, router_map, primary[0], runner_up,
+        rows, router_map, default, runner_up,
         extras=policies(router_map),
     )
     summary = {
@@ -544,6 +550,7 @@ def run(args) -> int:
         # Decision models answer a schema, not a chat turn: never tier members.
         "decision_models": decision_models(rows),
         "guests": guest_results,
+        "default_model": {"model": default, **default_note},
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

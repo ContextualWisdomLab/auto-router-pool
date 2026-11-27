@@ -270,3 +270,47 @@ class PickMicroTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DefaultModelTest(unittest.TestCase):
+    """The default path has no tier config, so it runs at the model's own effort."""
+
+    SHARP_AT_MAX = {
+        "max": {"index": 60.0, "in": 1, "out": 1},
+        "low": {"index": 30.0, "in": 1, "out": 1},
+    }
+    STRONG_ANYWHERE = {
+        "max": {"index": 55.0, "in": 1, "out": 1},
+        "low": {"index": 45.0, "in": 1, "out": 1},
+    }
+
+    def test_a_declared_default_effort_is_scored_at_that_rung(self):
+        rows = [{"model_name": "a", "litellm_params": {"reasoning_effort": "max"}}]
+        picked, note = pool.pick_default(
+            rows, {"a": self.SHARP_AT_MAX, "b": self.STRONG_ANYWHERE}, ["a", "b"]
+        )
+        self.assertEqual((picked, note["basis"], note["effort"]), ("a", "declared", "max"))
+        self.assertEqual(note["index"], 60.0)
+
+    def test_without_a_declared_default_the_floor_decides(self):
+        picked, note = pool.pick_default(
+            [], {"a": self.SHARP_AT_MAX, "b": self.STRONG_ANYWHERE}, ["a", "b"]
+        )
+        self.assertEqual((picked, note["basis"], note["effort"]), ("b", "floor", None))
+        self.assertEqual(note["index"], 45.0)
+
+    def test_siblings_that_disagree_declare_nothing(self):
+        rows = [
+            {"model_name": "a", "litellm_params": {"reasoning_effort": "high"}},
+            {"model_name": "a", "litellm_params": {"reasoning_effort": "low"}},
+        ]
+        self.assertIsNone(pool.declared_effort(rows, "a"))
+
+    def test_a_tie_keeps_the_pool_preference(self):
+        same = {"max": {"index": 50.0, "in": 1, "out": 1}}
+        picked, _ = pool.pick_default([], {"a": same, "b": same}, ["a", "b"])
+        self.assertEqual(picked, "a")
+
+    def test_an_unmeasured_model_never_beats_a_measured_one(self):
+        picked, _ = pool.pick_default([], {"a": {}, "b": self.STRONG_ANYWHERE}, ["a", "b"])
+        self.assertEqual(picked, "b")

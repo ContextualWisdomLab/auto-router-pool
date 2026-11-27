@@ -192,6 +192,61 @@ def free_gaps(rows: list[dict], scored) -> list[dict]:
     return gaps
 
 
+def declared_effort(rows: list[dict], name: str) -> str | None:
+    """The effort this group runs at when a request names none.
+
+    Only a deployment-level ``reasoning_effort`` states it. Sibling deployments
+    that disagree do not describe one default, so nothing is claimed then.
+    """
+    values = {
+        (row.get("litellm_params") or {}).get("reasoning_effort")
+        for row in rows if row["model_name"] == name
+    }
+    values.discard(None)
+    values.discard("")
+    return values.pop() if len(values) == 1 else None
+
+
+def effort_floor(variants: dict) -> float | None:
+    """Index at the weakest measured effort.
+
+    A request that names no effort may be served at any rung, so the lowest one
+    is the quality the router can actually promise on its default path.
+    """
+    indexes = [
+        entry.get("index") for entry in (variants or {}).values()
+        if entry.get("index")
+    ]
+    return min(indexes) if indexes else None
+
+
+def pick_default(rows: list[dict], candidates: dict[str, dict], preferred) -> tuple:
+    """Fallback model for a request the classifier cannot place in a tier.
+
+    The default path carries no ``tier_model_configs`` entry, so it runs at the
+    model's own default effort instead of the rung its best score was measured
+    at. A declared deployment default is scored at that rung; without one the
+    model is scored at its measured floor, which is what the router can promise
+    there. Ties keep the caller's preference order.
+    """
+    ranked = []
+    for order, name in enumerate(preferred):
+        variants = candidates.get(name) or {}
+        effort = declared_effort(rows, name)
+        entry = variants.get(effort) if effort else None
+        if entry and entry.get("index"):
+            index, basis = entry["index"], "declared"
+        else:
+            index, basis, effort = effort_floor(variants), "floor", None
+        ranked.append((index or 0, -order, name, basis, effort))
+    best = max(ranked)
+    return best[2], {
+        "basis": best[3],
+        "effort": best[4],
+        "index": round(best[0], 1) if best[0] else None,
+    }
+
+
 def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: str = "low"):
     """Cheapest remaining candidates, so light tiers need no supplied list.
 

@@ -53,6 +53,13 @@ the same model at `max`.
    timeout. It runs on every routed request, so it must be a model the router
    already selects and one with headroom: a stale classifier times out, and the
    cheapest model is usually the first to be rate-limited.
+
+   The *default* model -- the path a request takes when no tier is chosen -- has
+   no `tier_model_configs` entry, so it answers at its own default effort rather
+   than at the rung its best score was measured at. Candidates are ranked at
+   that effort: at the deployment's declared `reasoning_effort` when one exists,
+   and otherwise at the lowest rung they measured, which is the floor the default
+   path can promise. Ties keep the pool's preference order.
 5. **Diff** each router's tiers, efforts, context floor and classifier, validate
    server-side, back up, patch, re-read, and roll back on any mismatch.
 6. **Cap the advertised window** at the smallest `max_input_tokens` among the
