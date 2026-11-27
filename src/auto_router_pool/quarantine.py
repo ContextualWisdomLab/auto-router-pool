@@ -17,7 +17,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 
 from .extra_catalogs import litellm_container
-from .pool import MIN_INPUT_TOKENS, input_window
+from .pool import MIN_INPUT_TOKENS, group_state, input_window
 
 MARKER = "auto_pool_quarantined"
 BUDGET_MARKER = "auto_pool_budget_blocked"
@@ -208,10 +208,9 @@ sql = (
     "    AND COALESCE(metadata->'error_information'->>'error_message', '') NOT ILIKE '%%maximum context length%%'"
     ") AS bad "
     'FROM "LiteLLM_SpendLogs" '
-    'WHERE "startTime" >= ('
-    '  SELECT MAX("startTime") - make_interval(mins => %s) '
-    '  FROM "LiteLLM_SpendLogs"'
-    ') '
+    # SpendLogs stores UTC as a timestamp without a time zone.
+    'WHERE "startTime" >= '
+    "(CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - make_interval(mins => %s) "
     "  AND model_id IS NOT NULL AND model_id <> '' "
     "  AND call_type IN ('anthropic_messages', 'acompletion', 'aresponses') "
     "  AND NOT ("
@@ -287,7 +286,7 @@ def _eligible_live_models(rows: list[dict]) -> set[str]:
         and str((row.get("model_info") or {}).get("mode") or "chat") in ("chat", "completion")
         and not str(row.get("model_name") or "").startswith(("__", "auto"))
     }
-    return {name for name in names if input_window(rows, name) >= MIN_INPUT_TOKENS}
+    return {name for name in names if group_state(rows, name)[0]}
 
 
 def live_failure_sweep(
@@ -324,6 +323,8 @@ def live_failure_sweep(
     for row in rows:
         info = row.get("model_info") or {}
         if not info.get("blocked") or not info.get(LIVE_FAILURE_MARKER):
+            continue
+        if info.get(BUDGET_MARKER) or info.get(MARKER):
             continue
         blocked_at = _parse_iso(info.get(LIVE_FAILURE_AT))
         if blocked_at is None:
@@ -424,7 +425,7 @@ def live_failure_sweep(
                     "detail": f"block_{result['error_status']}",
                 })
                 continue
-            client.patch(
+            patch = client.patch(
                 f"/model/{deployment}/update",
                 {
                     "model_info": {
@@ -434,6 +435,21 @@ def live_failure_sweep(
                     }
                 },
             )
+            if patch.get("error_status") is not None:
+                # Only undo the block we just applied. Without the marker,
+                # a later sweep cannot tell this apart from a manual block.
+                rollback = client.post("/model/unblock", {"model_id": deployment})
+                detail = f"patch_{patch['error_status']}"
+                if rollback.get("error_status") is not None:
+                    info["blocked"] = True
+                    detail += f";rollback_unblock_{rollback['error_status']}"
+                actions.append({
+                    "model": name,
+                    "deployment": deployment,
+                    "action": "failed",
+                    "detail": detail,
+                })
+                continue
         info["blocked"] = True
         info[LIVE_FAILURE_MARKER] = True
         info[LIVE_FAILURE_AT] = now_iso

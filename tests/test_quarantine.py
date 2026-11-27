@@ -151,6 +151,81 @@ class SweepTest(unittest.TestCase):
         self.assertEqual(client.calls, [])
 
 class LiveFailureSweepTest(unittest.TestCase):
+    def test_batch_group_cannot_replace_last_eligible_chat_model(self):
+        for batch_is_blocked in (False, True):
+            with self.subTest(batch_is_blocked=batch_is_blocked):
+                rows = [row("chat", "1"), row("mixed", "2"),
+                        row("mixed", "3", blocked=batch_is_blocked)]
+                rows[2]["litellm_params"]["model"] = "openai/mixed:batch"
+                stats = [{"model_id": "1", "model": "openai/chat", "bad": 10}]
+                client = FakeClient()
+                actions = quarantine.live_failure_sweep(
+                    client, rows, ["chat"], stats, apply=True
+                )
+                self.assertEqual(actions[0]["action"], "kept")
+                self.assertEqual(client.calls, [])
+
+    def test_expired_live_cooldown_preserves_other_quarantine_reasons(self):
+        from datetime import datetime, timezone
+
+        for marker in (quarantine.BUDGET_MARKER, quarantine.MARKER):
+            with self.subTest(marker=marker):
+                rows = [row("chat", "1", blocked=True)]
+                info = rows[0]["model_info"]
+                info.update({
+                    marker: True,
+                    quarantine.LIVE_FAILURE_MARKER: True,
+                    quarantine.LIVE_FAILURE_AT: "2026-11-26T09:00:00Z",
+                })
+                client = FakeClient()
+                actions = quarantine.live_failure_sweep(
+                    client, rows, [], [], apply=True,
+                    now=datetime(2026, 11, 27, 10, tzinfo=timezone.utc),
+                )
+                self.assertEqual(actions, [])
+                self.assertEqual(client.calls, [])
+                self.assertTrue(info["blocked"])
+                self.assertTrue(info[marker])
+
+    def test_failed_live_marker_write_attempts_to_undo_block(self):
+        class FailingClient(FakeClient):
+            def patch(self, path, body):
+                super().patch(path, body)
+                return {"error_status": 500}
+
+            def post(self, path, body, timeout=None):
+                super().post(path, body, timeout)
+                if path == "/model/unblock" and rollback_fails:
+                    return {"error_status": 503}
+                return {}
+
+        for rollback_fails in (False, True):
+            with self.subTest(rollback_fails=rollback_fails):
+                rows = [row("chat", "1"), row("backup", "2")]
+                stats = [{"model_id": "1", "model": "openai/chat", "bad": 10}]
+                client = FailingClient()
+                actions = quarantine.live_failure_sweep(
+                    client, rows, ["chat"], stats, apply=True
+                )
+                detail = "patch_500"
+                if rollback_fails:
+                    detail += ";rollback_unblock_503"
+                self.assertEqual(actions, [{
+                    "model": "chat", "deployment": "1", "action": "failed",
+                    "detail": detail,
+                }])
+                self.assertEqual([call[1] for call in client.calls], [
+                    "/model/block", "/model/1/update", "/model/unblock",
+                ])
+                info = rows[0]["model_info"]
+                self.assertEqual(info["blocked"], rollback_fails)
+                self.assertNotIn(quarantine.LIVE_FAILURE_MARKER, info)
+                if not rollback_fails:
+                    retried = quarantine.live_failure_sweep(
+                        FakeClient(), rows, ["chat"], stats, apply=True
+                    )
+                    self.assertEqual(retried[0]["action"], "blocked")
+
     def test_blocks_managed_deployment_failing_on_live_surface_even_when_acompletion_passes(self):
         from datetime import datetime, timezone
 
