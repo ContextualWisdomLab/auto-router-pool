@@ -69,6 +69,96 @@ def prompt_cache_drop_pass(client, rows: list[dict], apply: bool = False) -> lis
     return changes
 
 
+def provider_prefix_pass(client, rows: list[dict], apply: bool = False) -> list[dict]:
+    """Ensure every deployment's model string names a provider.
+
+    LiteLLM routes by the ``provider/model`` form; a bare model name such as
+    ``gemini-3.8-flash-high`` has no transport and fails with "unknown
+    provider". The gateway is OpenAI-compatible, so a missing prefix is
+    repaired to ``openai/`` rather than guessed from the model name.
+    """
+    changes = []
+    for row in rows:
+        params = row.get("litellm_params") or {}
+        model = str(params.get("model") or "")
+        if not model or "/" in model:
+            continue
+        identifier = (row.get("model_info") or {}).get("id")
+        if not identifier:
+            continue
+        repaired = "openai/" + model
+        if apply:
+            result = client.patch(
+                f"/model/{urllib.parse.quote(identifier, safe='')}/update",
+                {"litellm_params": {"model": repaired}},
+            )
+            if result.get("error_status") is not None:
+                changes.append({
+                    "model": row["model_name"], "deployment": identifier,
+                    "action": "failed", "detail": f"error_{result['error_status']}",
+                })
+                continue
+        changes.append({
+            "model": row["model_name"], "deployment": identifier,
+            "action": "updated" if apply else "would_update",
+            "from": model, "to": repaired,
+        })
+    return changes
+
+
+def context_sync_pass(client, rows: list[dict], prices: dict | None = None,
+                      apply: bool = False) -> list[dict]:
+    """Fill missing context windows from LiteLLM's own model catalogue.
+
+    Deployments registered without an upstream catalogue entry keep no
+    ``max_input_tokens``, so the pool treats them as below the 272k floor.
+    LiteLLM's price/context map is keyed by model name; a tail match is enough
+    because the gateway often stores a provider-prefixed variant of the same
+    model. Only a missing window is touched, so an operator's explicit value
+    wins.
+    """
+    by_tail: dict[str, int] = {}
+    for key, entry in (prices or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("max_input_tokens")
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            continue
+        by_tail.setdefault(str(key).split("/")[-1], value)
+
+    changes = []
+    for row in rows:
+        info = row.get("model_info") or {}
+        if isinstance(info.get("max_input_tokens"), int) and not isinstance(
+            info.get("max_input_tokens"), bool
+        ) and info.get("max_input_tokens", 0) > 0:
+            continue
+        identifier = info.get("id")
+        if not identifier:
+            continue
+        tail = str(row.get("model_name") or "").split("/")[-1]
+        value = by_tail.get(tail)
+        if value is None:
+            continue
+        if apply:
+            result = client.patch(
+                f"/model/{urllib.parse.quote(identifier, safe='')}/update",
+                {"model_info": {"max_input_tokens": value}},
+            )
+            if result.get("error_status") is not None:
+                changes.append({
+                    "model": row["model_name"], "deployment": identifier,
+                    "action": "failed", "detail": f"error_{result['error_status']}",
+                })
+                continue
+        changes.append({
+            "model": row["model_name"], "deployment": identifier,
+            "action": "updated" if apply else "would_update",
+            "max_input_tokens": value,
+        })
+    return changes
+
+
 def pooled(params: dict) -> bool:
     """A CLIProxyAPI/Cursor bridge deployment whose cooldown this host owns."""
     from urllib.parse import urlsplit

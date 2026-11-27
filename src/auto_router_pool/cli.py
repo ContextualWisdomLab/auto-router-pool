@@ -41,7 +41,13 @@ from .apply import DECISION_CLASSIFIER
 from .catalog import sync as sync_catalog
 from .catalog import sync_batch
 from .extra_catalogs import sync_all as sync_provider_catalogs
-from .maintenance import health_report, prompt_cache_drop_pass, repair_cooldowns
+from .maintenance import (
+    context_sync_pass,
+    health_report,
+    prompt_cache_drop_pass,
+    provider_prefix_pass,
+    repair_cooldowns,
+)
 from .modality_benchmarks import load as load_modality_benchmarks
 from .pool import (
     MIN_INPUT_TOKENS,
@@ -402,6 +408,12 @@ def run(args) -> int:
         if args.maintenance:
             output["prompt_cache_drop"] = prompt_cache_drop_pass(
                 litellm, rows, apply=args.apply
+            )
+            output["provider_prefix"] = provider_prefix_pass(
+                litellm, rows, apply=args.apply
+            )
+            output["context_sync"] = context_sync_pass(
+                litellm, rows, prices, apply=args.apply
             )
         if args.repair_cooldowns:
             output["cooldowns"] = repair_cooldowns(
