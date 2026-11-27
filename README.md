@@ -79,6 +79,15 @@ the same model at `max`.
    the provider-route price recorded at registration fill it in. A model AA
    does not score falls back to original input price and name.
 
+   Image, video, audio/transcription and OCR groups use the same comparison.
+   Image and video feed their own router tiers; audio and OCR are ranked and
+   reported in `specialized` but have no complexity-router tier yet. Scores are
+   pinned from the Artificial Analysis Image, Video and Speech-to-Text
+   leaderboards (audio is `100 - AA-WER`) and can be overridden in
+   `<home>/auto-pool-modality-benchmarks.json`. OCR has no public benchmark, so
+   it is ordered by original input price. A model with neither a score nor a
+   price source is ranked last rather than guessed.
+
    The *default* model -- the path a request takes when no tier is chosen -- has
    no `tier_model_configs` entry, so it answers at its own default effort rather
    than at the rung its best score was measured at. Candidates are ranked at

@@ -244,6 +244,92 @@ def decision_index(name: str, scores: dict | None) -> float | None:
     return None
 
 
+SPECIALIZED_MODES = {
+    "image_generation": "image",
+    "video_generation": "video",
+    "audio_generation": "audio",
+    "audio_speech": "audio",
+    "audio_transcription": "audio",
+    "speech": "audio",
+    "transcription": "audio",
+    "tts": "audio",
+    "ocr": "ocr",
+}
+SPECIALIZED_OUTPUTS = {"image": "image", "video": "video", "audio": "audio"}
+SPECIALIZED_KINDS = ("image", "video", "audio", "ocr")
+
+
+def _specialized_kind(row: dict, catalog: dict | None = None) -> str | None:
+    """The modality a row serves, from registration and then the price map.
+
+    Transcription models are often registered as ``chat`` guests; the price
+    map still calls them ``audio_transcription``, so that row is used rather
+    than letting them disappear as context-below-floor chat models.
+    """
+    info = row.get("model_info") or {}
+    kind = SPECIALIZED_MODES.get(str(info.get("mode") or "").lower())
+    if kind:
+        return kind
+    for output in info.get("output_modalities") or []:
+        kind = SPECIALIZED_OUTPUTS.get(str(output).lower())
+        if kind:
+            return kind
+    entry = catalog_entry(
+        str((row.get("litellm_params") or {}).get("model") or ""), catalog
+    )
+    if isinstance(entry, dict):
+        return SPECIALIZED_MODES.get(str(entry.get("mode") or "").lower())
+    return None
+
+
+def specialized_models(rows: list[dict], catalog: dict | None = None,
+                        scores: dict | None = None) -> dict[str, list[str]]:
+    """Rank each non-chat family by score per original input price.
+
+    Image and video feed their own router tiers; audio and OCR are reported in
+    the same order, because the complexity router has no tier for them yet.
+    A model without a measured score is ordered by price and name, and a model
+    without any price source is never given a pretended one.
+    """
+    grouped: dict[str, dict[str, list[dict]]] = {}
+    for row in rows:
+        kind = _specialized_kind(row, catalog)
+        if kind:
+            grouped.setdefault(kind, {}).setdefault(row["model_name"], []).append(row)
+    scores = scores or {}
+    found: dict[str, list[str]] = {}
+    for kind in SPECIALIZED_KINDS:
+        families = grouped.get(kind) or {}
+        names = [
+            name for name, deployments in families.items()
+            if any(not (row.get("model_info") or {}).get("blocked")
+                   for row in deployments)
+        ]
+
+        def rank(name: str, kind=kind, families=families) -> tuple:
+            deployments = families[name]
+            measured = scores.get(kind, {}).get(name)
+            if isinstance(measured, dict):
+                measured = measured.get("score")
+            prices = [model_price(row, rows, catalog) for row in deployments]
+            known = [price for price in prices if price is not None]
+            price = min(known) if known else None
+            unknown_price = price is None
+            if isinstance(measured, (int, float)) and not isinstance(measured, bool):
+                value = measured / price if price and price > 0 else measured
+                return (
+                    0, -value, -measured, unknown_price,
+                    price if price is not None else float("inf"), name,
+                )
+            return (
+                1, 0.0, 0.0, unknown_price,
+                price if price is not None else float("inf"), name,
+            )
+
+        found[kind] = sorted(names, key=rank)
+    return found
+
+
 def decision_models(rows: list[dict]) -> list[str]:
     """Groups that are decision models, reported instead of looking broken.
 

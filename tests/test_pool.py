@@ -395,6 +395,53 @@ class ClassifierCandidateTest(unittest.TestCase):
         self.assertNotIn("decision_index", entries[0])
 
 
+class SpecializedTest(unittest.TestCase):
+    def row(self, name, mode, cost=None, blocked=False, upstream=None, outputs=None):
+        params = {"model": upstream or name}
+        if cost is not None:
+            params["input_cost_per_token"] = cost
+        info = {"mode": mode, "blocked": blocked}
+        if outputs:
+            info["output_modalities"] = outputs
+        return {"model_name": name, "litellm_params": params, "model_info": info}
+
+    def test_score_per_original_price_orders_a_family(self):
+        rows = [
+            self.row("quality", "image_generation", cost=4e-6),
+            self.row("value", "image_generation", cost=1e-6),
+        ]
+        found = pool.specialized_models(
+            rows, scores={"image": {"quality": 100.0, "value": 50.0}}
+        )
+        self.assertEqual(found["image"], ["value", "quality"])
+
+    def test_a_measured_model_beats_an_unmeasured_one(self):
+        rows = [
+            self.row("measured", "video_generation", cost=2e-6),
+            self.row("unmeasured", "video_generation", cost=1e-7),
+        ]
+        found = pool.specialized_models(rows, scores={"video": {"measured": 1000.0}})
+        self.assertEqual(found["video"], ["measured", "unmeasured"])
+
+    def test_price_map_mode_finds_audio(self):
+        rows = [self.row("asr", "chat", cost=2.5e-6,
+                         upstream="gpt-4o-transcribe")]
+        catalog = {"gpt-4o-transcribe": {
+            "mode": "audio_transcription", "input_cost_per_token": 2.5e-6,
+        }}
+        found = pool.specialized_models(rows, catalog, {"audio": {"asr": 96.0}})
+        self.assertEqual(found["audio"], ["asr"])
+
+    def test_a_blocked_family_is_not_listed(self):
+        rows = [self.row("img", "image_generation", blocked=True)]
+        self.assertEqual(pool.specialized_models(rows)["image"], [])
+
+    def test_all_kinds_are_reported(self):
+        self.assertEqual(
+            set(pool.specialized_models([])), {"image", "video", "audio", "ocr"}
+        )
+
+
 class DecisionCatalogTest(unittest.TestCase):
     CATALOG = {
         "typesafe/jev-latest": {"mode": "evaluation", "max_input_tokens": 32000},

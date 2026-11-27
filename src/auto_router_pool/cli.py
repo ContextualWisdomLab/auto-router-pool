@@ -40,6 +40,7 @@ from .apply import DECISION_CLASSIFIER
 from .catalog import sync as sync_catalog
 from .extra_catalogs import sync_all as sync_provider_catalogs
 from .maintenance import health_report, prompt_cache_drop_pass, repair_cooldowns
+from .modality_benchmarks import load as load_modality_benchmarks
 from .pool import (
     MIN_INPUT_TOKENS,
     changed_scores,
@@ -55,6 +56,7 @@ from .pool import (
     decision_candidates,
     decision_catalog,
     decision_models,
+    specialized_models,
     free_gaps,
     free_models,
 )
@@ -148,36 +150,6 @@ def catalogue(rows: list[dict], prefix: str = "", suffixes=()) -> list[str]:
         if "complexity_router_config" not in (row.get("litellm_params") or {})
     ]
     return filtered(names, prefix, suffixes)
-
-
-# Modality comes from LiteLLM's own registration metadata (``model_info.mode``),
-# never from a model name: a name is a label someone typed, the mode is what the
-# proxy will actually call.
-MEDIA_MODES = {"image_generation": "image", "video_generation": "video"}
-
-
-def media_models(rows: list[dict]) -> dict[str, list[str]]:
-    """Registered image/video generators that still have an open deployment.
-
-    These deployments answer no chat probe and declare no input window, so they
-    are selected by modality and blocked flags only, and only their own tiers
-    may route to them.
-    """
-    counts: dict[tuple[str, str], list[int]] = {}
-    for row in rows:
-        info = row.get("model_info") or {}
-        kind = MEDIA_MODES.get(info.get("mode") or "")
-        if not kind:
-            continue
-        state = counts.setdefault((kind, row["model_name"]), [0, 0])
-        state[0] += 1
-        if not info.get("blocked"):
-            state[1] += 1
-    found: dict[str, list[str]] = {"image": [], "video": []}
-    for (kind, name), (_, open_deployments) in counts.items():
-        if open_deployments:
-            found[kind].append(name)
-    return {kind: sorted(names) for kind, names in found.items()}
 
 
 def selected_models(rows: list[dict]) -> list[str]:
@@ -441,6 +413,7 @@ def run(args) -> int:
             catalog = json.loads(Path(catalog_path).read_text())
     except (OSError, ValueError):
         catalog = {}
+    modality_scores = load_modality_benchmarks(settings.home)
 
     # A model missing from the registry is invisible to the router, and the
     # upstream catalogue is the only place a new one exists. Registration is
@@ -669,12 +642,17 @@ def run(args) -> int:
     tier_plan = schedule(
         [premium[0], primary[0], budget[0], runner_up], candidates
     )
-    specialized = media_models(rows)
+    specialized = specialized_models(rows, catalog, modality_scores)
+    # The complexity router has image and video tiers only; audio and OCR are
+    # ranked in the summary but must not be handed to a text/media tier.
+    media_specialized = {
+        kind: specialized.get(kind, []) for kind in ("image", "video")
+    }
     router_map = routers(
         primary[0], premium[0], budget[0], runner_up, micro, top,
         ladders=candidates,
         windows={name: input_window(rows, name) for name in candidates},
-        specialized=specialized,
+        specialized=media_specialized,
         free_models=free,
     )
     # The classifier contract travels with the tiers: LiteLLM rejects a tier map
