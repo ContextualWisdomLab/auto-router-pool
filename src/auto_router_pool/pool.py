@@ -95,6 +95,30 @@ def score(variants: dict, effort: str):
     return entry["index"], entry["index"] / blended, entry
 
 
+def free_models(rows: list[dict]) -> set[str]:
+    """Model groups that cost nothing, judged by registration metadata.
+
+    A deployment that declares zero input *and* zero output cost is free, which
+    only the catalogue can say for certain: a model that merely looks cheap in a
+    scored comparison is not free. A group with any paid deployment is not free
+    either, because the router may reach that one.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row["model_name"], []).append(row.get("model_info") or {})
+
+    free = set()
+    for name, deployments in groups.items():
+        live = [info for info in deployments if not info.get("blocked")] or deployments
+        if all(
+            info.get("input_cost_per_token") == 0
+            and info.get("output_cost_per_token") == 0
+            for info in live
+        ):
+            free.add(name)
+    return free
+
+
 def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: str = "low"):
     """Cheapest remaining candidates, so light tiers need no supplied list.
 

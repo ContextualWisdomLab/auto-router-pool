@@ -54,6 +54,14 @@ class PlaceTest(unittest.TestCase):
         )
         self.assertEqual(placed["entries"][0], ("flat", "high", 56.0))
 
+    def test_frontier_chain_prefers_the_free_model(self):
+        ladders = {
+            "paid": {"max": {"index": 50.0, "in": 3, "out": 15}},
+            "free": {"max": {"index": 50.0, "in": 3, "out": 15}},
+        }
+        placed = assign.place(["paid", "free"], ladders, free_models={"free"})
+        self.assertEqual(placed["entries"][0][0], "free")
+
     def test_unrated_model_is_reported_not_placed(self):
         placed = assign.place(["astra", "sol", "ghost"], {"astra": ASTRA, "sol": SOL})
         self.assertEqual(placed["unrated"], ["ghost"])
@@ -197,6 +205,30 @@ class GrowTest(unittest.TestCase):
             tier_map, {"astra": ASTRA, "sol": SOL, "old": OLD_SOL}, limit=2
         )
         self.assertEqual(grown["tier"], [("old", "max"), ("astra", "medium")])
+
+    def test_a_free_model_leads_the_group(self):
+        # The first entry is the one the router tries, so a model the catalogue
+        # prices at nothing moves ahead of an equally scored paid one.
+        ladders = {
+            "paid": {"max": {"index": 50.0, "in": 3, "out": 15}},
+            "free": {"max": {"index": 50.0, "in": 3, "out": 15}},
+        }
+        grown = assign.grow(
+            {"frontier": [("paid", "max")]}, ladders, free_models={"free"}
+        )
+        self.assertEqual(grown["frontier"], [("free", "max"), ("paid", "max")])
+
+    def test_the_boost_only_reorders_the_same_members(self):
+        ladders = {
+            "paid": {"max": {"index": 50.0, "in": 3, "out": 15}},
+            "free": {"max": {"index": 50.0, "in": 3, "out": 15}},
+        }
+        plain = assign.grow({"frontier": [("paid", "max")]}, ladders)
+        boosted = assign.grow(
+            {"frontier": [("paid", "max")]}, ladders, free_models={"free"}
+        )
+        self.assertEqual(set(plain["frontier"]), set(boosted["frontier"]))
+        self.assertEqual(plain["frontier"][0], ("paid", "max"))
 
     def test_padding_cannot_shrink_the_window(self):
         tier_map = {"tier": [("old", "max")]}

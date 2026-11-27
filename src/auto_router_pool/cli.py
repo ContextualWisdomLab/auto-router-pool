@@ -40,6 +40,7 @@ from .pool import (
     pick_micro,
     score_hashes,
     stable_deployments,
+    free_models,
 )
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
 
@@ -460,8 +461,13 @@ def run(args) -> int:
         micro = pick_micro(
             candidates, [premium[0], primary[0], budget[0], runner_up]
         )
+    # A group whose deployments cost nothing leads its model group, so the
+    # router tries it before any paid sibling of the same score.
+    free = free_models(rows)
     top = {name: top_effort(variants) for name, variants in candidates.items()}
-    frontier = place([premium[0], primary[0], runner_up], candidates)
+    frontier = place(
+        [premium[0], primary[0], runner_up], candidates, free_models=free
+    )
     # Fewest score-equal tiers that cover every measured level of this roster.
     tier_plan = schedule(
         [premium[0], primary[0], budget[0], runner_up], candidates
@@ -472,6 +478,7 @@ def run(args) -> int:
         ladders=candidates,
         windows={name: input_window(rows, name) for name in candidates},
         specialized=specialized,
+        free_models=free,
     )
     # The classifier contract travels with the tiers: LiteLLM rejects a tier map
     # that does not cover every defined tier, so both are written in one patch.

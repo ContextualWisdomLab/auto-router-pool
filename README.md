@@ -155,6 +155,14 @@ the tier's modality, and keeps the tier's declared input window intact. Width is
 never a configured number: the roster decides how many interchangeable fallbacks
 a tier gets.
 
+A **free deployment leads its model group**. When every deployment of a group
+declares zero input and output cost in its registration metadata, that group is
+moved to the front of the tier's chain, so the router tries it before a paid
+sibling of the same score. This is ordering only: membership and rung placement
+are settled first, and a group with any paid deployment does not qualify, because
+the router could reach that one. The measured price never decides it — an
+unpriced model is not a free model.
+
 ## Flaky deployments
 
 A model can be registered more than once (one deployment per credential or

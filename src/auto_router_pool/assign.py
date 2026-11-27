@@ -97,6 +97,20 @@ def _rungs(variants: dict) -> list[dict]:
     return sorted(rungs, key=lambda rung: rung["index"])
 
 
+def _free_first(entries: list[tuple], free_models=()) -> list[tuple]:
+    """Stable ordering that lets a free deployment lead its model group.
+
+    Only the order changes: the tier's membership and rung choices are settled
+    before this runs, so a free model is simply tried first. ``free_models``
+    comes from registration metadata -- a model group whose deployments declare
+    zero input and output cost -- never from a measured price, so a merely cheap
+    model is not mistaken for a free one.
+    """
+    if not free_models:
+        return entries
+    return sorted(entries, key=lambda entry: 0 if entry[0] in free_models else 1)
+
+
 def _cheapest(rungs: list[dict], target: float, band: float, profile=DEFAULT_PROFILE):
     """Cheapest rung inside ``[target, target + band]``; ties go lower."""
     inside = [rung for rung in rungs if target <= rung["index"] <= target + band]
@@ -188,7 +202,8 @@ def roles(ladders: dict) -> dict[str, tuple | None]:
     return chosen
 
 
-def place(models, ladders: dict, band: float = SPREAD, profile=DEFAULT_PROFILE) -> dict:
+def place(models, ladders: dict, band: float = SPREAD, profile=DEFAULT_PROFILE,
+          free_models=()) -> dict:
     """Equal-score placement of ``models`` given their measured ladders.
 
     Returns ``target`` (the chain's assumed score), ``entries`` as
@@ -229,6 +244,7 @@ def place(models, ladders: dict, band: float = SPREAD, profile=DEFAULT_PROFILE) 
         return {**empty, "skipped": list(rated)}
 
     _, target, entries = best
+    entries = _free_first(entries, free_models)
     placed = [model for model, _, _ in entries]
     indexes = [index for _, _, index in entries]
     return {
@@ -249,6 +265,7 @@ def grow(
     windows: dict | None = None,
     profiles: dict | None = None,
     allow=None,
+    free_models=(),
 ) -> dict:
     """Tier sizes as the solution of the same program, not a chosen number.
 
@@ -303,7 +320,9 @@ def grow(
             extra.append((cost(rung, profile), -rung["index"], name, rung["effort"]))
         extra.sort()
         room = len(extra) if limit is None else min(limit - len(kept), len(extra))
-        grown[tier] = kept + [(name, effort) for _, _, name, effort in extra[:room]]
+        grown[tier] = _free_first(
+            kept + [(name, effort) for _, _, name, effort in extra[:room]], free_models
+        )
     return grown
 
 

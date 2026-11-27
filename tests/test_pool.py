@@ -116,6 +116,30 @@ class ContextFloorTest(unittest.TestCase):
         )
 
 
+class FreeModelsTest(unittest.TestCase):
+    def rows(self, *specs):
+        return [{"model_name": name, "model_info": info} for name, info in specs]
+
+    def test_only_zero_cost_deployments_are_free(self):
+        rows = self.rows(
+            ("free-model", {"input_cost_per_token": 0, "output_cost_per_token": 0}),
+            ("paid-model", {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05}),
+        )
+        self.assertEqual(pool.free_models(rows), {"free-model"})
+
+    def test_one_paid_deployment_makes_the_group_paid(self):
+        # The router may reach any deployment of the group, so a mixed group is
+        # not free and must not jump the queue.
+        rows = self.rows(
+            ("mixed", {"input_cost_per_token": 0, "output_cost_per_token": 0}),
+            ("mixed", {"input_cost_per_token": 3e-06, "output_cost_per_token": 1e-05}),
+        )
+        self.assertEqual(pool.free_models(rows), set())
+
+    def test_an_unpriced_group_is_not_free(self):
+        self.assertEqual(pool.free_models(self.rows(("unknown", {}))), set())
+
+
 class PickMicroTest(unittest.TestCase):
     def test_taken_roles_are_excluded(self):
         candidates = {

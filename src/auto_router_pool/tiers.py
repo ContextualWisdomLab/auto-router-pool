@@ -209,23 +209,26 @@ def _compact(tier_map: dict) -> dict:
     return cleaned
 
 
-def _top(entries, ladder_models, models_by_role, top, ladders, band, profile):
+def _top(entries, ladder_models, models_by_role, top, ladders, band, profile,
+         free_models=()):
     """Top tier: equal-score placement when the ladders are known."""
     fallback = [(models_by_role[role], top.get(models_by_role[role], "xhigh")) for role in entries]
     if not ladders:
         return fallback
-    placed = place([name for name, _ in fallback], ladders, band, profile)
+    placed = place(
+        [name for name, _ in fallback], ladders, band, profile, free_models
+    )
     if len(placed["entries"]) != len(fallback):
         return fallback
     return [(model, effort) for model, effort, _ in placed["entries"]]
 
 
-def _frontier(premium, primary, runner_up, top, ladders, band):
+def _frontier(premium, primary, runner_up, top, ladders, band, free_models=()):
     return _top(
         ("premium", "primary", "runner_up"),
         None,
         {"premium": premium, "primary": primary, "runner_up": runner_up},
-        top, ladders, band, "deep",
+        top, ladders, band, "deep", free_models,
     )
 
 
@@ -239,6 +242,7 @@ def auto_tiers(
     ladders=None,
     band: float = SPREAD,
     specialized=None,
+    free_models=(),
 ):
     micro = list(micro)[:2] + [""] * (2 - len(list(micro)[:2]))
     top = top or {}
@@ -249,7 +253,9 @@ def auto_tiers(
         T_CHAT: [(budget, "high"), (primary, "medium"), (premium, "medium")],
         T_CODE: [(primary, "medium"), (runner_up, "medium"), (premium, "medium")],
         T_OPS: [(primary, "high"), (premium, "high"), (runner_up, "high")],
-        FRONTIER: _frontier(premium, primary, runner_up, top, ladders, band),
+        FRONTIER: _frontier(
+            premium, primary, runner_up, top, ladders, band, free_models
+        ),
         T_VISION: [(primary, "medium"), (premium, "medium")],
         # Media generators answer no chat probe and declare no input window, so
         # they are listed by modality and carry no effort setting.
@@ -353,6 +359,7 @@ def routers(
     per_tier: int | None = None,
     windows=None,
     specialized=None,
+    free_models=(),
 ):
     """Map router name -> tier spec.
 
@@ -371,7 +378,8 @@ def routers(
 
     maps = {
         "auto": auto_tiers(
-            primary, premium, budget, runner_up, micro, top, ladders, band, specialized
+            primary, premium, budget, runner_up, micro, top, ladders, band,
+            specialized, free_models,
         ),
         "auto-classify": classify_tiers(primary, premium, budget, runner_up, micro),
         "auto-strix": strix_tiers(primary, premium, budget, runner_up, micro),
@@ -386,7 +394,8 @@ def routers(
     if ladders:
         maps = {
             name: grow(
-                tier_map, ladders, per_tier, band, windows, profiles[name], allow
+                tier_map, ladders, per_tier, band, windows, profiles[name], allow,
+                free_models,
             )
             for name, tier_map in maps.items()
         }
