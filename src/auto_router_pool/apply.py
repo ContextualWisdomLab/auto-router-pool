@@ -6,9 +6,49 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .pool import decision_classifier
 from .tiers import build
 
 CLASSIFIER_TIMEOUT_MS = 30_000
+DECISION_CLASSIFIER = "oss_classifier"
+# A decision model answers in one forward pass, but it may be cold or hosted far
+# away; the LLM judge's 30s floor is the right order of magnitude for both.
+DECISION_CLASSIFIER_TIMEOUT_MS = 30_000
+
+
+def classifier_shape(config: dict) -> tuple[str, str]:
+    """``(kind, model)`` for whichever classifier form the config uses.
+
+    A decision model classifies on its own endpoint (``oss_classifier`` plus a
+    deployment name); anything else is the chat-completion judge that
+    ``classifier_llm_config`` configures.
+    """
+    if str(config.get("classifier_type")) == DECISION_CLASSIFIER:
+        deployment = (config.get("opensource_classifier_config") or {}).get(
+            "deployment_name"
+        )
+        return DECISION_CLASSIFIER, deployment or ""
+    return "llm", (config.get("classifier_llm_config") or {}).get("model") or ""
+
+
+def _classifier_spec(classifier) -> dict | None:
+    """Accept a bare model name (an LLM judge) or an explicit ``{type, model}``."""
+    if not classifier:
+        return None
+    if isinstance(classifier, dict):
+        return {
+            "type": classifier.get("type") or "llm",
+            "model": classifier.get("model") or "",
+        }
+    return {"type": "llm", "model": classifier}
+
+
+def _blocked(rows: list[dict], name: str) -> bool:
+    """No deployment of this group can answer."""
+    group = [row for row in rows if row["model_name"] == name]
+    return not group or all(
+        (row.get("model_info") or {}).get("blocked") for row in group
+    )
 
 
 def context_cap(rows: list[dict], tiers: dict) -> int | None:
@@ -77,16 +117,24 @@ def classifier_drift(rows: list[dict], names=()) -> list[str]:
         if not isinstance(tiers, dict) or not tiers:
             continue
         models = {model for entries in tiers.values() for model in entries if model}
-        classifier = config.get("classifier_llm_config") or {}
-        if (
-            classifier.get("model") not in models
-            or (classifier.get("timeout_ms") or 0) < CLASSIFIER_TIMEOUT_MS
-        ):
+        kind, model = classifier_shape(config)
+        if kind == DECISION_CLASSIFIER:
+            stale = _blocked(rows, model)
+        else:
+            stale = (
+                model not in models
+                or ((config.get("classifier_llm_config") or {}).get("timeout_ms") or 0)
+                < CLASSIFIER_TIMEOUT_MS
+                # A usable decision model is the cheaper, more direct classifier,
+                # so staying on the chat judge is drift too.
+                or (decision_classifier(rows) not in (None, model))
+            )
+        if stale:
             drift.append(row["model_name"])
     return drift
 
 
-def plan(rows: list[dict], routers: dict, default: str, classifier: str | None = None,
+def plan(rows: list[dict], routers: dict, default: str, classifier=None,
          extras: dict | None = None):
     """Return the routers whose tiers, contract, context floor or classifier differ.
 
@@ -95,6 +143,7 @@ def plan(rows: list[dict], routers: dict, default: str, classifier: str | None =
     tiers: LiteLLM refuses a tier map that does not cover every defined tier, so
     writing one without the other is rejected at load time.
     """
+    classifier = _classifier_spec(classifier)
     by_name = {row["model_name"]: row for row in rows}
     changes = []
     for name, tier_map in routers.items():
@@ -118,11 +167,14 @@ def plan(rows: list[dict], routers: dict, default: str, classifier: str | None =
         )
         classifier_changed = False
         if classifier:
-            current = config.get("classifier_llm_config") or {}
-            classifier_changed = (
-                current.get("model") != classifier
-                or (current.get("timeout_ms") or 0) < CLASSIFIER_TIMEOUT_MS
+            classifier_changed = classifier_shape(config) != (
+                classifier["type"], classifier["model"]
             )
+            if classifier["type"] == "llm" and not classifier_changed:
+                current = config.get("classifier_llm_config") or {}
+                classifier_changed = (
+                    current.get("timeout_ms") or 0
+                ) < CLASSIFIER_TIMEOUT_MS
         cap = context_cap(rows, tiers)
         cap_changed = (
             cap is not None
@@ -146,12 +198,26 @@ def plan(rows: list[dict], routers: dict, default: str, classifier: str | None =
             config["default_model"] = default
             config.update(contract)
             if classifier:
-                current = dict(config.get("classifier_llm_config") or {})
-                current["model"] = classifier
-                current["timeout_ms"] = max(
-                    int(current.get("timeout_ms") or 0), CLASSIFIER_TIMEOUT_MS
-                )
-                config["classifier_llm_config"] = current
+                if classifier["type"] == DECISION_CLASSIFIER:
+                    decision = dict(config.get("opensource_classifier_config") or {})
+                    decision["deployment_name"] = classifier["model"]
+                    decision["timeout_ms"] = max(
+                        int(decision.get("timeout_ms") or 0),
+                        DECISION_CLASSIFIER_TIMEOUT_MS,
+                    )
+                    config["classifier_type"] = DECISION_CLASSIFIER
+                    config["opensource_classifier_config"] = decision
+                else:
+                    # The LLM config keeps its rubric, vision and circuit-breaker
+                    # settings, so switching back from a decision model does not
+                    # lose the tuning that was already there.
+                    current = dict(config.get("classifier_llm_config") or {})
+                    current["model"] = classifier["model"]
+                    current["timeout_ms"] = max(
+                        int(current.get("timeout_ms") or 0), CLASSIFIER_TIMEOUT_MS
+                    )
+                    config["classifier_type"] = "llm"
+                    config["classifier_llm_config"] = current
             change["config"] = config
             change["litellm_params"] = {
                 **row["litellm_params"],
@@ -220,7 +286,6 @@ def apply(client, changes: list[dict]):
         if "config" in change:
             actual = got.get("litellm_params", {}).get("complexity_router_config", {})
             classifier = change.get("classifier")
-            actual_classifier = actual.get("classifier_llm_config") or {}
             contract_drift = any(
                 actual.get(key) != change["config"][key]
                 for key in ("tier_definitions", "classification_examples",
@@ -231,11 +296,8 @@ def apply(client, changes: list[dict]):
             )
             if contract_drift or actual.get("tiers") != change["config"]["tiers"] or (
                 classifier
-                and (
-                    actual_classifier.get("model") != classifier
-                    or (actual_classifier.get("timeout_ms") or 0)
-                    < CLASSIFIER_TIMEOUT_MS
-                )
+                and classifier_shape(actual)
+                != (classifier["type"], classifier["model"])
             ):
                 for old in changes:
                     client.patch(f"/model/{old['id']}/update", _patch_body(old, rollback=True))

@@ -171,6 +171,22 @@ def decision_models(rows: list[dict]) -> list[str]:
     )
 
 
+def decision_classifier(rows: list[dict]) -> str | None:
+    """A decision model this gateway can actually use as its classifier.
+
+    The router asks one question — which tier — and a decision model answers that
+    directly, so classification costs one cheap forward pass instead of a chat
+    completion. The 272k solver floor does not apply: the classifier reads a
+    short prompt, not the request, so its window cannot bound what the router
+    advertises.
+    """
+    for name in decision_models(rows):
+        group = [row for row in rows if row["model_name"] == name]
+        if any(not (row.get("model_info") or {}).get("blocked") for row in group):
+            return name
+    return None
+
+
 def free_gaps(rows: list[dict], scored) -> list[dict]:
     """Free groups the router cannot use yet, each with the reason.
 

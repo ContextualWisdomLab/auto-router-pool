@@ -49,10 +49,17 @@ the same model at `max`.
    `micro` is not chosen by a floor either: it is the two cheapest candidates the
    run already proved usable, at `low`, so the light tiers need no supplied list.
 
-   The complexity classifier is pinned to the `runner_up` model with a 30s
-   timeout. It runs on every routed request, so it must be a model the router
-   already selects and one with headroom: a stale classifier times out, and the
-   cheapest model is usually the first to be rate-limited.
+   The complexity classifier prefers a **decision model**: any registered model
+   that serves `/v1/decisions` or `/v1/systemone` and has an unblocked deployment
+   becomes `classifier_type: oss_classifier` with
+   `opensource_classifier_config.deployment_name`, because asking "which tier" is
+   one cheap forward pass rather than a whole chat completion. When no decision
+   model can answer, it falls back to the LLM judge pinned to `runner_up` with a
+   30s timeout -- a model the router already selects and one with headroom, since
+   a stale classifier times out and the cheapest model is usually the first to be
+   rate-limited. `classifier_drift` treats both a dead decision deployment and an
+   LLM judge that outlived a usable decision model as drift, so the switch happens
+   on the next run and reverses when credits or an upstream disappear.
 
    The *default* model -- the path a request takes when no tier is chosen -- has
    no `tier_model_configs` entry, so it answers at its own default effort rather

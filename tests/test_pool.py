@@ -314,3 +314,20 @@ class DefaultModelTest(unittest.TestCase):
     def test_an_unmeasured_model_never_beats_a_measured_one(self):
         picked, _ = pool.pick_default([], {"a": {}, "b": self.STRONG_ANYWHERE}, ["a", "b"])
         self.assertEqual(picked, "b")
+
+
+class DecisionClassifierTest(unittest.TestCase):
+    def rows(self, blocked):
+        return [{"model_name": "clef", "litellm_params": {},
+                 "model_info": {"id": "clef-1", "mode": "decision", "blocked": blocked}}]
+
+    def test_a_usable_decision_model_becomes_the_classifier(self):
+        self.assertEqual(pool.decision_classifier(self.rows(False)), "clef")
+
+    def test_a_blocked_decision_model_is_not_usable(self):
+        self.assertIsNone(pool.decision_classifier(self.rows(True)))
+
+    def test_a_chat_model_is_never_a_decision_classifier(self):
+        rows = [{"model_name": "luna", "litellm_params": {},
+                 "model_info": {"mode": "chat", "blocked": False}}]
+        self.assertIsNone(pool.decision_classifier(rows))

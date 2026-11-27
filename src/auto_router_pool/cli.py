@@ -30,6 +30,7 @@ from .apply import (
     validate,
 )
 from .client import Client, deployment_health, models, probe
+from .apply import DECISION_CLASSIFIER
 from .pool import (
     MIN_INPUT_TOKENS,
     changed_scores,
@@ -41,6 +42,7 @@ from .pool import (
     pick_micro,
     score_hashes,
     stable_deployments,
+    decision_classifier,
     decision_models,
     free_gaps,
     free_models,
@@ -549,8 +551,16 @@ def run(args) -> int:
     default, default_note = pick_default(
         rows, candidates, [primary[0], premium[0], runner_up]
     )
+    # A decision model answers "which tier" in one forward pass, so it is the
+    # classifier whenever the gateway can actually call one; the LLM judge is the
+    # fallback, not the default.
+    decision = decision_classifier(rows)
+    classifier = (
+        {"type": DECISION_CLASSIFIER, "model": decision} if decision
+        else {"type": "llm", "model": runner_up}
+    )
     changes = plan(
-        rows, router_map, default, runner_up,
+        rows, router_map, default, classifier,
         extras=policies(router_map),
     )
     summary = {
@@ -579,6 +589,7 @@ def run(args) -> int:
         "decision_models": decision_models(rows),
         "guests": guest_results,
         "default_model": {"model": default, **default_note},
+        "classifier": classifier,
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

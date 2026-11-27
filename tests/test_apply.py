@@ -243,3 +243,73 @@ class MediaCapTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecisionClassifierPlanTest(unittest.TestCase):
+    def row(self):
+        row = router("auto", 400000, {"SIMPLE": [("small", "low")]})
+        row["litellm_params"]["complexity_router_config"]["classifier_llm_config"] = {
+            "model": "small", "timeout_ms": apply.CLASSIFIER_TIMEOUT_MS,
+        }
+        return row
+
+    def decision(self, blocked=False):
+        return {"model_name": "clef", "litellm_params": {},
+                "model_info": {"id": "clef-1", "mode": "decision", "blocked": blocked}}
+
+    def test_plan_writes_the_decision_classifier(self):
+        rows = [self.row(), model("small", 400000), self.decision()]
+        changes = apply.plan(
+            rows, {"auto": {"SIMPLE": [("small", "low")]}}, "small",
+            {"type": apply.DECISION_CLASSIFIER, "model": "clef"},
+        )
+        config = changes[0]["config"]
+        self.assertEqual(config["classifier_type"], "oss_classifier")
+        self.assertEqual(
+            config["opensource_classifier_config"]["deployment_name"], "clef"
+        )
+        self.assertEqual(
+            config["opensource_classifier_config"]["timeout_ms"],
+            apply.DECISION_CLASSIFIER_TIMEOUT_MS,
+        )
+
+    def test_switching_back_to_the_llm_judge_changes_the_type(self):
+        row = self.row()
+        row["litellm_params"]["complexity_router_config"].update({
+            "classifier_type": "oss_classifier",
+            "opensource_classifier_config": {"deployment_name": "clef",
+                                             "timeout_ms": 30000},
+        })
+        rows = [row, model("small", 400000)]
+        changes = apply.plan(
+            rows, {"auto": {"SIMPLE": [("small", "low")]}}, "small", "small"
+        )
+        config = changes[0]["config"]
+        self.assertEqual(config["classifier_type"], "llm")
+        self.assertEqual(config["classifier_llm_config"]["model"], "small")
+
+    def test_a_blocked_decision_deployment_is_drift(self):
+        row = self.row()
+        row["litellm_params"]["complexity_router_config"].update({
+            "classifier_type": "oss_classifier",
+            "opensource_classifier_config": {"deployment_name": "clef",
+                                             "timeout_ms": 30000},
+        })
+        self.assertEqual(apply.classifier_drift([row, self.decision(True)]), ["auto"])
+
+    def test_an_llm_judge_is_drift_while_a_decision_model_is_usable(self):
+        self.assertEqual(
+            apply.classifier_drift([self.row(), self.decision()]), ["auto"]
+        )
+
+    def test_the_decision_form_is_verified_on_read_back(self):
+        rows = [self.row(), model("small", 400000), self.decision()]
+        client = FakeClient(rows)
+        changes = apply.plan(
+            rows, {"auto": {"SIMPLE": [("small", "low")]}}, "small",
+            {"type": apply.DECISION_CLASSIFIER, "model": "clef"},
+        )
+        apply.apply(client, changes)
+        config = rows[0]["litellm_params"]["complexity_router_config"]
+        self.assertEqual(config["classifier_type"], "oss_classifier")
+        self.assertEqual(config["opensource_classifier_config"]["deployment_name"], "clef")
