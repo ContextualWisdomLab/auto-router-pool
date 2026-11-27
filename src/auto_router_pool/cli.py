@@ -38,6 +38,8 @@ from .client import (
 )
 from .apply import DECISION_CLASSIFIER
 from .catalog import sync as sync_catalog
+from .extra_catalogs import sync_all as sync_provider_catalogs
+from .maintenance import health_report, prompt_cache_drop_pass, repair_cooldowns
 from .pool import (
     MIN_INPUT_TOKENS,
     changed_scores,
@@ -322,6 +324,22 @@ def parse_args(argv=None):
         help="register upstream catalogue models the gateway does not carry yet",
     )
     parser.add_argument(
+        "--sync-catalogs", action="store_true",
+        help="sync the Cursor, Anthropic and CLIProxy catalogues and exit",
+    )
+    parser.add_argument(
+        "--maintenance", action="store_true",
+        help="apply missing prompt_cache_key drops and exit",
+    )
+    parser.add_argument(
+        "--repair-cooldowns", action="store_true",
+        help="cap pooled cooldowns, clear only proven recoveries, and exit",
+    )
+    parser.add_argument(
+        "--health-report", action="store_true",
+        help="write a bounded health report for every deployment and exit",
+    )
+    parser.add_argument(
         "--prices", type=Path, default=None,
         help="pinned LiteLLM price map for --live-fallbacks",
     )
@@ -379,6 +397,38 @@ def run(args) -> int:
         return 0
 
     litellm = Client(settings.litellm_base, settings.key)
+
+    # The provider-specific syncs and upkeep jobs keep their own cadence but no
+    # longer need a script of their own: one cron entry now calls this program.
+    if args.sync_catalogs or args.maintenance or args.repair_cooldowns or args.health_report:
+        rows = models(litellm)
+        catalog_path = args.prices or (settings.home / "litellm-model-prices-main.json")
+        prices = {}
+        try:
+            if catalog_path and Path(catalog_path).exists():
+                prices = json.loads(Path(catalog_path).read_text())
+        except (OSError, ValueError):
+            prices = {}
+        output = {}
+        if args.sync_catalogs:
+            output["catalogs"] = sync_provider_catalogs(
+                litellm, settings.home, rows, prices, apply=args.apply
+            )
+        if args.maintenance:
+            output["prompt_cache_drop"] = prompt_cache_drop_pass(
+                litellm, rows, apply=args.apply
+            )
+        if args.repair_cooldowns:
+            output["cooldowns"] = repair_cooldowns(
+                litellm, rows, settings.home, apply=args.apply
+            )
+        if args.health_report:
+            output["health"] = health_report(
+                litellm, rows, settings.home, redact=settings.key
+            )
+        print(json.dumps(output, ensure_ascii=False))
+        return 0
+
     rows = models(litellm)
 
     # Registration metadata is a claim; the external price catalogue is the

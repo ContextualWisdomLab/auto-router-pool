@@ -86,6 +86,24 @@ the same model at `max`.
 
 An unchanged pool writes nothing.
 
+## Other catalogues and upkeep
+
+The provider catalogues and the upkeep jobs are built into the same program, so
+a host schedules one entry point instead of a directory of scripts:
+
+| flag | what it does |
+|---|---|
+| `--sync-catalog` | register missing Experiential models (inside the pool run) |
+| `--sync-catalogs` | Cursor Cloud snapshot, Cursor chat bases, Anthropic official models, CLIProxyAPI `gemini-4-argon` |
+| `--maintenance` | add `prompt_cache_key` to the drop list of providers that refuse it |
+| `--repair-cooldowns` | cap pooled bridge cooldowns at 30s and clear one only after two real answers |
+| `--health-report` | write a bounded per-deployment health report |
+
+Each mode honours `--apply`; without it they preview. A missing credential, an
+unreachable catalogue or a failed discovery is reported in the JSON summary and
+skipped, so one provider never hides the others. None of these modes changes a
+block flag: `--quarantine` owns those.
+
 ## Effort ladder matters
 
 Scores are per effort, not per model. Measured on the Artificial Analysis
