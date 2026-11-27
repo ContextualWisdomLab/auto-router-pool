@@ -19,12 +19,22 @@ def context_cap(rows: list[dict], tiers: dict) -> int | None:
     proven: return ``None`` instead of guessing a larger number.
     """
     capacities: dict[str, int] = {}
+    interactive: set[str] = set()
     for row in rows:
-        value = (row.get("model_info") or {}).get("max_input_tokens")
+        info = row.get("model_info") or {}
+        name = row["model_name"]
+        # An image, video or embedding deployment never receives the routed chat
+        # request, so its window cannot bound what the router advertises.
+        if info.get("mode") not in (None, "chat", "completion"):
+            continue
+        interactive.add(name)
+        value = info.get("max_input_tokens")
         if type(value) is int and value > 0:
-            name = row["model_name"]
             capacities[name] = min(capacities.get(name, value), value)
-    names = {model for models in tiers.values() for model in models if model}
+    names = {
+        model for models in tiers.values() for model in models
+        if model and model in interactive
+    }
     if not names or any(name not in capacities for name in names):
         return None
     return min(capacities[name] for name in names)
@@ -76,8 +86,15 @@ def classifier_drift(rows: list[dict], names=()) -> list[str]:
     return drift
 
 
-def plan(rows: list[dict], routers: dict, default: str, classifier: str | None = None):
-    """Return only the routers whose tiers, efforts, context floor or classifier differ."""
+def plan(rows: list[dict], routers: dict, default: str, classifier: str | None = None,
+         extras: dict | None = None):
+    """Return the routers whose tiers, contract, context floor or classifier differ.
+
+    ``extras`` carries the classifier contract (tier definitions, examples,
+    prompt, fallback) per router. It must be written in the same patch as the
+    tiers: LiteLLM refuses a tier map that does not cover every defined tier, so
+    writing one without the other is rejected at load time.
+    """
     by_name = {row["model_name"]: row for row in rows}
     changes = []
     for name, tier_map in routers.items():
@@ -86,9 +103,18 @@ def plan(rows: list[dict], routers: dict, default: str, classifier: str | None =
             continue
         tiers, configs = build(tier_map)
         config = copy.deepcopy(row["litellm_params"]["complexity_router_config"])
+        contract = (extras or {}).get(name) or {}
+        if contract.get("tier_definitions"):
+            # The engine refuses custom tiers together with the built-in severity
+            # order: affinity ordering and the default-model fallback both assume
+            # it. Custom tiers therefore drop affinity and fall back explicitly.
+            config["session_affinity"] = False
+            config.pop("classifier_fallback", None)
+        contract_changed = any(config.get(key) != value for key, value in contract.items())
         params_changed = (
             config.get("tiers") != tiers
             or config.get("tier_model_configs") != configs
+            or contract_changed
         )
         classifier_changed = False
         if classifier:
@@ -118,6 +144,7 @@ def plan(rows: list[dict], routers: dict, default: str, classifier: str | None =
             config["tiers"] = tiers
             config["tier_model_configs"] = configs
             config["default_model"] = default
+            config.update(contract)
             if classifier:
                 current = dict(config.get("classifier_llm_config") or {})
                 current["model"] = classifier
@@ -194,7 +221,15 @@ def apply(client, changes: list[dict]):
             actual = got.get("litellm_params", {}).get("complexity_router_config", {})
             classifier = change.get("classifier")
             actual_classifier = actual.get("classifier_llm_config") or {}
-            if actual.get("tiers") != change["config"]["tiers"] or (
+            contract_drift = any(
+                actual.get(key) != change["config"][key]
+                for key in ("tier_definitions", "classification_examples",
+                            "classification_prompt", "fallback_tier",
+                            "classification_mode", "session_affinity",
+                            "classifier_fallback")
+                if key in change["config"]
+            )
+            if contract_drift or actual.get("tiers") != change["config"]["tiers"] or (
                 classifier
                 and (
                     actual_classifier.get("model") != classifier

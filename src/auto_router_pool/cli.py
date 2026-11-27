@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import aa
-from .assign import SPREAD, place, schedule
+from .assign import SPREAD, place, roles, schedule
 from .apply import apply as apply_changes
 from .apply import (
     backup,
@@ -36,14 +36,13 @@ from .pool import (
     fingerprint,
     flaky_deployments,
     group_state,
-    pick,
+    input_window,
     pick_micro,
-    pick_primary,
-    score,
     score_hashes,
     stable_deployments,
+    free_models,
 )
-from .tiers import ROUTERS, routers, top_effort
+from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
 
 
 def default_home() -> Path:
@@ -130,6 +129,36 @@ def catalogue(rows: list[dict], prefix: str = "", suffixes=()) -> list[str]:
         if "complexity_router_config" not in (row.get("litellm_params") or {})
     ]
     return filtered(names, prefix, suffixes)
+
+
+# Modality comes from LiteLLM's own registration metadata (``model_info.mode``),
+# never from a model name: a name is a label someone typed, the mode is what the
+# proxy will actually call.
+MEDIA_MODES = {"image_generation": "image", "video_generation": "video"}
+
+
+def media_models(rows: list[dict]) -> dict[str, list[str]]:
+    """Registered image/video generators that still have an open deployment.
+
+    These deployments answer no chat probe and declare no input window, so they
+    are selected by modality and blocked flags only, and only their own tiers
+    may route to them.
+    """
+    counts: dict[tuple[str, str], list[int]] = {}
+    for row in rows:
+        info = row.get("model_info") or {}
+        kind = MEDIA_MODES.get(info.get("mode") or "")
+        if not kind:
+            continue
+        state = counts.setdefault((kind, row["model_name"]), [0, 0])
+        state[0] += 1
+        if not info.get("blocked"):
+            state[1] += 1
+    found: dict[str, list[str]] = {"image": [], "video": []}
+    for (kind, name), (_, open_deployments) in counts.items():
+        if open_deployments:
+            found[kind].append(name)
+    return {kind: sorted(names) for kind, names in found.items()}
 
 
 def selected_models(rows: list[dict]) -> list[str]:
@@ -403,28 +432,20 @@ def run(args) -> int:
     updates = changed_scores(hashes, previous_scores)
     cache_path.write_text(json.dumps(cache))
 
-    premium = pick(candidates, "xhigh", 12, 45)
-    primary = pick_primary(candidates)
-    budget = pick(candidates, "medium", 0.30, 1.50, mode="value")
+    # Roles are solved, not capped: the cheapest model that reaches each role's
+    # measured floor wins, so no price is written into the policy.
+    assigned = roles(candidates)
+    premium = assigned["premium"]
+    primary = assigned["primary"]
+    budget = assigned["budget"]
     if not (premium and primary and budget):
         print(json.dumps({"error": "insufficient valid candidates", "status": status}))
         return 1
-
-    eligible = sorted(
-        (
-            (name, score(variants, "high"))
-            for name, variants in candidates.items()
-            if score(variants, "high")
-            and score(variants, "high")[2]["in"] <= 3
-            and score(variants, "high")[2]["out"] <= 12
-        ),
-        key=lambda item: item[1][0],
-        reverse=True,
-    )
-    runner_up = next((name for name, _ in eligible if name != primary[0]), None)
+    runner_up = assigned["runner_up"]
     if not runner_up:
         print(json.dumps({"error": "no runner-up candidate", "status": status}))
         return 1
+    runner_up = runner_up[0]
 
     # Light tiers need small models; by default they come from the pool itself,
     # so nothing has to be named on the command line. ``--micro`` stays as an
@@ -440,20 +461,30 @@ def run(args) -> int:
         micro = pick_micro(
             candidates, [premium[0], primary[0], budget[0], runner_up]
         )
+    # A group whose deployments cost nothing leads its model group, so the
+    # router tries it before any paid sibling of the same score.
+    free = free_models(rows)
     top = {name: top_effort(variants) for name, variants in candidates.items()}
-    frontier = place([premium[0], primary[0], runner_up], candidates)
+    frontier = place(
+        [premium[0], primary[0], runner_up], candidates, free_models=free
+    )
     # Fewest score-equal tiers that cover every measured level of this roster.
     tier_plan = schedule(
         [premium[0], primary[0], budget[0], runner_up], candidates
     )
+    specialized = media_models(rows)
+    router_map = routers(
+        primary[0], premium[0], budget[0], runner_up, micro, top,
+        ladders=candidates,
+        windows={name: input_window(rows, name) for name in candidates},
+        specialized=specialized,
+        free_models=free,
+    )
+    # The classifier contract travels with the tiers: LiteLLM rejects a tier map
+    # that does not cover every defined tier, so both are written in one patch.
     changes = plan(
-        rows,
-        routers(
-            primary[0], premium[0], budget[0], runner_up, micro, top,
-            ladders=candidates,
-        ),
-        primary[0],
-        runner_up,
+        rows, router_map, primary[0], runner_up,
+        extras=policies(router_map),
     )
     summary = {
         "catalogue": source,
@@ -471,8 +502,9 @@ def run(args) -> int:
         "frontier": {
             "target": None if frontier["target"] is None else round(frontier["target"], 2),
             "spread": round(frontier["spread"], 2),
-            "efforts": {model: effort for model, effort, _ in frontier["entries"]},
+            "efforts": dict(router_map["auto"][FRONTIER]),
         },
+        "specialized": specialized,
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

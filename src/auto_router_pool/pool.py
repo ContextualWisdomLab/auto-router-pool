@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 
+from .assign import cost
+
 ROUTING_POLICY_VERSION = 2
 
 
@@ -93,59 +95,49 @@ def score(variants: dict, effort: str):
     return entry["index"], entry["index"] / blended, entry
 
 
-def pick(
-    candidates: dict[str, dict],
-    effort: str,
-    max_in: float,
-    max_out: float,
-    *,
-    mode: str = "quality",
-    tolerance: float = 2.0,
-    deprioritize_suffix: str | None = None,
-):
-    """Choose a model under a price cap.
+def declares_free(row: dict) -> bool:
+    """The deployment says it is free, in words rather than in numbers.
 
-    ``quality`` maximises the index and then prefers the cheapest option within
-    ``tolerance`` points, which keeps a marginal +0.5 from buying a 4x price.
-    ``value`` maximises index per blended dollar.
+    OpenRouter free tiers carry a ``:free`` upstream suffix; an operator can also
+    tag a deployment ``is_free`` or ``free`` in ``model_info``.
     """
-    scored = []
-    for name, variants in candidates.items():
-        result = score(variants, effort)
-        if not result:
-            continue
-        index, value, entry = result
-        if entry["in"] > max_in or entry["out"] > max_out:
-            continue
-        scored.append((name, index, value, (entry["in"] + entry["out"]) / 2, entry))
-    if not scored:
-        return None
-    if mode == "value":
-        best = max(scored, key=lambda item: item[2])
-    else:
-        top = max(item[1] for item in scored)
-        best = min(
-            (item for item in scored if item[1] >= top - tolerance),
-            key=lambda item: (
-                deprioritize_suffix is not None
-                and item[0].lower().endswith(deprioritize_suffix),
-                item[3],
-            ),
-        )
-    return best[0], best[2], best[1], best[4]
+    info = row.get("model_info") or {}
+    upstream = str((row.get("litellm_params") or {}).get("model") or "").lower()
+    tags = {str(tag).lower() for tag in (info.get("tags") or [])}
+    return upstream.endswith(":free") or info.get("is_free") is True or "free" in tags
 
 
-def pick_primary(candidates: dict[str, dict]):
-    return pick(candidates, "high", 3, 12, deprioritize_suffix="-astra")
+def free_models(rows: list[dict]) -> set[str]:
+    """Model groups that cost nothing, judged by an explicit free marker.
+
+    Cost fields cannot answer this in either direction, which is why they are not
+    consulted: a registration that was never priced declares zero, and a free
+    tier may still carry a price. Only a marker counts, and a group qualifies
+    only when *every* deployment the router could reach carries it -- one paid
+    sibling makes the group paid, because the router may reach that one.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row["model_name"], []).append(row)
+
+    free = set()
+    for name, deployments in groups.items():
+        live = [
+            row for row in deployments
+            if not (row.get("model_info") or {}).get("blocked")
+        ] or deployments
+        if all(declares_free(row) for row in live):
+            free.add(name)
+    return free
 
 
 def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: str = "low"):
     """Cheapest remaining candidates, so light tiers need no supplied list.
 
     A light tier exists to be cheap and fast, so the small models are the ones
-    the pool already proved usable and that cost least at the light effort.
-    Price comes first and index only breaks a tie, because a pricey "small"
-    model defeats the tier it is placed in.
+    the pool already proved usable and that cost least for an extraction-sized
+    run. Input and output prices enter separately (``assign.cost``): a light
+    tier is mostly prompt, so a low output price alone proves nothing.
     """
     skip = set(taken)
     priced = []
@@ -156,6 +148,6 @@ def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: st
         if not result:
             continue
         index, _, entry = result
-        priced.append((name, (entry["in"] + entry["out"]) / 2, index))
+        priced.append((name, cost(entry, "extract"), index))
     priced.sort(key=lambda item: (item[1], -item[2]))
     return [name for name, _, _ in priced[:limit]]

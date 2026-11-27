@@ -8,16 +8,6 @@ VARIANTS = {
     "medium": {"index": 52.7, "in": 2, "out": 10},
 }
 
-CANDIDATES = {
-    "model-primary": VARIANTS,
-    "model-premium": {
-        "xhigh": {"index": 61.6, "in": 8, "out": 40},
-        "high": {"index": 60.1, "in": 8, "out": 40},
-    },
-    "model-budget": {"medium": {"index": 18.5, "in": 0.1, "out": 0.5}},
-}
-
-
 class ScoreTest(unittest.TestCase):
     def test_missing_effort_falls_back_to_max(self):
         index, value, entry = pool.score(VARIANTS, "xhigh")
@@ -44,33 +34,6 @@ class DeploymentFlakinessTest(unittest.TestCase):
             "unknown": ["unknown", "unknown", "unknown"],
         }
         self.assertEqual(pool.stable_deployments(samples), {"healthy"})
-
-
-class PickTest(unittest.TestCase):
-    def test_primary_prefers_non_astra_within_quality_tolerance(self):
-        candidates = {
-            "brand-astra": {"high": {"index": 60, "in": 1, "out": 5}},
-            "brand-sol": {"high": {"index": 58, "in": 2, "out": 10}},
-        }
-        self.assertEqual(pool.pick_primary(candidates)[0], "brand-sol")
-        self.assertEqual(pool.pick(candidates, "high", 3, 12)[0], "brand-astra")
-        candidates["brand-sol"]["high"]["index"] = 57.9
-        self.assertEqual(pool.pick_primary(candidates)[0], "brand-astra")
-
-    def test_quality_prefers_index_but_breaks_ties_on_price(self):
-        chosen = pool.pick(CANDIDATES, "high", 12, 45)
-        self.assertEqual(chosen[0], "model-premium")
-
-    def test_quality_honours_price_cap(self):
-        chosen = pool.pick(CANDIDATES, "high", 3, 12)
-        self.assertEqual(chosen[0], "model-primary")
-
-    def test_value_prefers_index_per_dollar(self):
-        chosen = pool.pick(CANDIDATES, "medium", 0.3, 1.5, mode="value")
-        self.assertEqual(chosen[0], "model-budget")
-
-    def test_no_candidate_under_cap(self):
-        self.assertIsNone(pool.pick(CANDIDATES, "high", 1, 1))
 
 
 class FingerprintTest(unittest.TestCase):
@@ -150,6 +113,58 @@ class ContextFloorTest(unittest.TestCase):
         self.assertEqual(
             pool.group_state(self.rows(400000), "m", minimum=500000),
             (False, "context_below_floor"),
+        )
+
+
+class FreeModelsTest(unittest.TestCase):
+    def row(self, name, upstream, info=None):
+        return {
+            "model_name": name,
+            "litellm_params": {"model": upstream},
+            "model_info": info or {},
+        }
+
+    def test_a_free_tier_is_recognised_by_its_upstream_id(self):
+        rows = [
+            self.row("free-model", "openrouter/google/gemma-4-31b-it:free"),
+            self.row("paid-model", "openai/gpt-6.2-sol"),
+        ]
+        self.assertEqual(pool.free_models(rows), {"free-model"})
+
+    def test_a_free_tier_with_configured_costs_is_still_free(self):
+        # A free tier may still carry a price, so cost must not decide this.
+        rows = [self.row(
+            "free-model", "openrouter/x/y:free",
+            {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05},
+        )]
+        self.assertEqual(pool.free_models(rows), {"free-model"})
+
+    def test_an_unpriced_group_is_not_free(self):
+        # Costs left unset declare zero (or nothing); that is not a free model.
+        rows = [
+            self.row("zero", "openai/paid-model",
+                     {"input_cost_per_token": 0, "output_cost_per_token": 0}),
+            self.row("unset", "openai/other-model",
+                     {"input_cost_per_token": None, "output_cost_per_token": None}),
+            self.row("absent", "openai/third-model"),
+        ]
+        self.assertEqual(pool.free_models(rows), set())
+
+    def test_one_paid_deployment_makes_the_group_paid(self):
+        # The router may reach any deployment of the group, so a mixed group is
+        # not free and must not jump the queue.
+        rows = [
+            self.row("mixed", "openai/gpt-6-luna:free"),
+            self.row("mixed", "openai/devin/gpt-6-luna"),
+        ]
+        self.assertEqual(pool.free_models(rows), set())
+
+    def test_an_operator_tag_can_mark_a_group_free(self):
+        rows = [self.row("tagged", "openai/custom", {"tags": ["free"]})]
+        self.assertEqual(pool.free_models(rows), {"tagged"})
+        self.assertEqual(
+            pool.free_models([self.row("flagged", "openai/custom", {"is_free": True})]),
+            {"flagged"},
         )
 
 

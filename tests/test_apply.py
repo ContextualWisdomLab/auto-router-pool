@@ -192,5 +192,54 @@ class AutoFallbackTest(unittest.TestCase):
         self.assertEqual(client.posts, [])
 
 
+class ContractTest(unittest.TestCase):
+    def test_contract_is_written_with_the_tiers(self):
+        rows = [router("auto", 400000, {"SIMPLE": [("small", "low")]}), model("small", 400000)]
+        contract = {
+            "tier_definitions": [{"name": "SIMPLE", "description": "d"}],
+            "fallback_tier": "SIMPLE",
+        }
+        changes = apply.plan(
+            rows, {"auto": {"SIMPLE": [("small", "low")]}}, "small",
+            extras={"auto": contract},
+        )
+        self.assertTrue(changes)
+        self.assertEqual(changes[0]["config"]["fallback_tier"], "SIMPLE")
+
+    def test_custom_tiers_drop_the_builtin_affinity_contract(self):
+        rows = [router("auto", 400000, {"SIMPLE": [("small", "low")]}), model("small", 400000)]
+        rows[0]["litellm_params"]["complexity_router_config"].update(
+            {"session_affinity": True, "classifier_fallback": "default_model"}
+        )
+        changes = apply.plan(
+            rows, {"auto": {"SIMPLE": [("small", "low")]}}, "small",
+            extras={"auto": {"tier_definitions": [{"name": "SIMPLE", "description": "d"}]}},
+        )
+        config = changes[0]["config"]
+        self.assertFalse(config["session_affinity"])
+        self.assertNotIn("classifier_fallback", config)
+
+    def test_matching_contract_needs_no_write(self):
+        rows = [router("auto", 400000, {"SIMPLE": [("small", "low")]}), model("small", 400000)]
+        contract = {"tier_definitions": [{"name": "SIMPLE", "description": "d"}]}
+        rows[0]["litellm_params"]["complexity_router_config"].update(contract)
+        self.assertEqual(
+            apply.plan(
+                rows, {"auto": {"SIMPLE": [("small", "low")]}}, "small",
+                extras={"auto": contract},
+            ),
+            [],
+        )
+
+
+class MediaCapTest(unittest.TestCase):
+    def test_media_deployments_do_not_bound_the_window(self):
+        rows = [
+            {"model_name": "chatty", "model_info": {"id": "c", "mode": "chat", "max_input_tokens": 400000}},
+            {"model_name": "painter", "model_info": {"id": "p", "mode": "image_generation"}},
+        ]
+        self.assertEqual(apply.context_cap(rows, {"T": ["chatty", "painter"]}), 400000)
+
+
 if __name__ == "__main__":
     unittest.main()
