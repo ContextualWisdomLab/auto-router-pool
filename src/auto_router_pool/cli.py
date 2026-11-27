@@ -35,6 +35,7 @@ from .client import (
     models,
     probe,
     probe_decision_choice,
+    probe_with_usage,
 )
 from .apply import DECISION_CLASSIFIER
 from .catalog import sync as sync_catalog
@@ -555,21 +556,30 @@ def run(args) -> int:
 
     status: dict[str, str] = {}
     probe_failures: dict[str, str] = {}
+    observed_usage: dict[str, dict] = {}
     candidates: dict[str, dict] = {}
     structural: list[str] = []
+
+    def note_usage(observation) -> None:
+        """Keep a probe's usage verdict without changing availability."""
+        if isinstance(observation, dict):
+            observed_usage[name] = observation
+
     for name in names:
         usable, reason = group_state(rows, name)
         if not usable:
             status[name] = reason
             continue
-        ok, reason = probe(litellm, name)
+        ok, reason, observation = probe_with_usage(litellm, name)
+        note_usage(observation)
         if not ok:
             blocked, note = triage_deployments(
                 litellm, rows, name, apply=args.apply
             )
             if blocked and args.apply:
                 quarantined.extend(blocked)
-                ok, reason = probe(litellm, name)
+                ok, reason, observation = probe_with_usage(litellm, name)
+                note_usage(observation)
             elif blocked:
                 reason = f"{reason};would_block={','.join(blocked)}"
             elif note in ("single_deployment", "no_stable_sibling"):
@@ -643,8 +653,11 @@ def run(args) -> int:
             candidates, [premium[0], primary[0], budget[0], runner_up]
         )
     # A group whose deployments cost nothing leads its model group, so the
-    # router tries it before any paid sibling of the same score.
-    free = free_models(rows)
+    # router tries it before any paid sibling of the same score. The probe's
+    # usage object is direct evidence: a stale :free marker does not outrank a
+    # positive measured cost, and a measured zero-cost call can add a group the
+    # marker missed.
+    free = free_models(rows, observed_usage)
     top = {name: top_effort(variants) for name, variants in candidates.items()}
     frontier = place(
         [premium[0], primary[0], runner_up], candidates, free_models=free
@@ -739,7 +752,21 @@ def run(args) -> int:
         "specialized": specialized,
         # Free groups the pool cannot route yet, so a registered-but-blocked or
         # still-unmeasured free model is visible instead of silently absent.
-        "free_gaps": free_gaps(rows, candidates),
+        "free_gaps": free_gaps(rows, candidates, observed_usage),
+        "free_usage": {
+            "free": sorted(
+                name for name, observation in observed_usage.items()
+                if observation.get("free") is True
+            ),
+            "paid": sorted(
+                name for name, observation in observed_usage.items()
+                if observation.get("free") is False
+            ),
+            "unknown": sum(
+                1 for observation in observed_usage.values()
+                if observation.get("free") is None
+            ),
+        },
         # Decision models answer a schema, not a chat turn: never tier members.
         "decision_models": decision_models(rows),
         # Batch models are registered for /v1/batches and never chat tiers.

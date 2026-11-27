@@ -134,26 +134,56 @@ def declares_free(row: dict) -> bool:
     return upstream.endswith(":free") or info.get("is_free") is True or "free" in tags
 
 
-def free_models(rows: list[dict]) -> set[str]:
-    """Model groups that cost nothing, judged by an explicit free marker.
+def declared_free_models(rows: list[dict]) -> set[str]:
+    """Groups whose every reachable deployment *declares* itself free.
 
-    Cost fields cannot answer this in either direction, which is why they are not
-    consulted: a registration that was never priced declares zero, and a free
-    tier may still carry a price. Only a marker counts, and a group qualifies
-    only when *every* deployment the router could reach carries it -- one paid
-    sibling makes the group paid, because the router may reach that one.
+    A declaration is not proof of cost: a ``:free`` suffix or tag can remain
+    while a provider configuration still bills the call. This is used for the
+    ``free_gaps`` report; tier ordering uses the measured ``free_models``.
     """
     groups: dict[str, list[dict]] = {}
     for row in rows:
         groups.setdefault(row["model_name"], []).append(row)
-
-    free = set()
+    found = set()
     for name, deployments in groups.items():
         live = [
             row for row in deployments
             if not (row.get("model_info") or {}).get("blocked")
         ] or deployments
         if all(declares_free(row) for row in live):
+            found.add(name)
+    return found
+
+
+def free_models(rows: list[dict], observed: dict | None = None) -> set[str]:
+    """Model groups a probe actually measured as free.
+
+    A registration marker alone is not enough: SpendLogs shows a ``:free``
+    group can still be billed depending on provider configuration. Only a
+    probe's ``usage.cost == 0`` -- with zero ``cost_details`` when they are
+    present -- adds a group. A paid
+    call vetoes it even when the marker says free. One free call proves only one
+    deployment, so a multi-deployment group needs the marker to confirm that all
+    of its routes are free; ``gpt-6-luna`` has both zero-cost and paid rows.
+    Unknown usage is not free.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row["model_name"], []).append(row)
+
+    observed = observed or {}
+    free = set()
+    for name, deployments in groups.items():
+        seen = observed.get(name)
+        if isinstance(seen, dict):
+            seen = seen.get("free")
+        if seen is not True:
+            continue
+        live = [
+            row for row in deployments
+            if not (row.get("model_info") or {}).get("blocked")
+        ] or deployments
+        if all(declares_free(row) for row in live) or len(live) == 1:
             free.add(name)
     return free
 
@@ -542,15 +572,20 @@ def decision_classifier(rows: list[dict], catalog: dict | None = None,
     return candidates[0] if candidates else None
 
 
-def free_gaps(rows: list[dict], scored) -> list[dict]:
+def free_gaps(rows: list[dict], scored, observed: dict | None = None) -> list[dict]:
     """Free groups the router cannot use yet, each with the reason.
 
     A free group only earns its place in a chain once the router can actually
     select it, so a group that is registered but blocked, below the context
     floor, or simply unmeasured would otherwise disappear without a trace.
     This reports them instead: the model name and why it is not in the pool.
+    With probe observations, only a measured free group is reported; without
+    them (reporting alone), the declaration is the only available signal.
     """
-    free = free_models(rows)
+    free = (
+        free_models(rows, observed) if observed is not None
+        else declared_free_models(rows)
+    )
     if not free:
         return []
     known = set(scored or ())

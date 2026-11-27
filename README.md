@@ -233,15 +233,18 @@ the tier's modality, and keeps the tier's declared input window intact. Width is
 never a configured number: the roster decides how many interchangeable fallbacks
 a tier gets.
 
-A **free deployment leads its model group**. A group whose every reachable
-deployment is explicitly marked free — OpenRouter's `:free` upstream suffix, or an
-`is_free` / `free` tag in `model_info` — is moved to the front of the tier's
-chain, so the router tries it before a paid sibling of the same score. This is
-ordering only: membership and rung placement are settled first, and a group with
-any paid deployment does not qualify, because the router could reach that one.
-Cost fields cannot decide this in either direction, so they are not consulted: a
-registration that was never priced declares zero, and a free tier may still carry
-a price.
+A **free deployment leads its model group only after a probe proves it is free**.
+The one-token assignment probe reads the response's `usage` object:
+`usage.cost == 0` (and zero `cost_details` when present) is the proof. A positive cost vetoes
+the group even when a `:free` marker or tag says otherwise, because SpendLogs
+shows marker-based pricing can still bill depending on provider configuration.
+A marker alone, or a missing/unknown cost field, is not treated as free. A
+single free call only proves one deployment, so it does not make a
+multi-deployment group free; the group must already be marked free or have only
+that one live route. This is ordering only: membership and rung placement are
+settled first. SpendLogs also shows `usage_object.cost` is more reliable than
+the `spend` column (the latter can be zero while the former is positive), and
+OpenAI paid answers may omit cost entirely.
 
 ### Guest models
 

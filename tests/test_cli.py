@@ -151,6 +151,34 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual(result["error_status"], "unreachable")
 
 
+class UsageTest(unittest.TestCase):
+    def test_a_zero_cost_usage_is_free(self):
+        self.assertIs(client.usage_free({
+            "cost": 0.0,
+            "cost_details": {"upstream_inference_cost": 0},
+        }), True)
+
+    def test_a_positive_cost_is_paid(self):
+        self.assertIs(client.usage_free({"cost": 0.0001}), False)
+
+    def test_missing_cost_is_unknown(self):
+        self.assertIsNone(client.usage_free({"prompt_tokens": 7}))
+
+    def test_byok_is_not_a_free_tier(self):
+        self.assertIs(client.usage_free({"cost": 0.0, "is_byok": True}), False)
+
+    def test_a_string_cost_is_still_read(self):
+        self.assertIs(client.usage_free({"cost": "0.0"}), True)
+        self.assertIs(client.usage_free({"cost": "0.001"}), False)
+
+    def test_probe_keeps_the_usage_observation(self):
+        result = {"model": "m", "usage": {"cost": 0.0}}
+        self.assertEqual(
+            client.probe_with_usage(StubClient(result), "m"),
+            (True, "ok", {"free": True, "cost": 0.0}),
+        )
+
+
 class MicroTest(unittest.TestCase):
     def row(self, name):
         return {"model_name": name, "model_info": {"max_input_tokens": 400000}}

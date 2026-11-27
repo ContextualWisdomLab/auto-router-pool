@@ -129,7 +129,7 @@ class FreeModelsTest(unittest.TestCase):
             self.row("free-model", "openrouter/google/gemma-4-31b-it:free"),
             self.row("paid-model", "openai/gpt-6.2-sol"),
         ]
-        self.assertEqual(pool.free_models(rows), {"free-model"})
+        self.assertEqual(pool.declared_free_models(rows), {"free-model"})
 
     def test_a_free_tier_with_configured_costs_is_still_free(self):
         # A free tier may still carry a price, so cost must not decide this.
@@ -137,7 +137,7 @@ class FreeModelsTest(unittest.TestCase):
             "free-model", "openrouter/x/y:free",
             {"input_cost_per_token": 2e-06, "output_cost_per_token": 1e-05},
         )]
-        self.assertEqual(pool.free_models(rows), {"free-model"})
+        self.assertEqual(pool.declared_free_models(rows), {"free-model"})
 
     def test_an_unpriced_group_is_not_free(self):
         # Costs left unset declare zero (or nothing); that is not a free model.
@@ -148,7 +148,7 @@ class FreeModelsTest(unittest.TestCase):
                      {"input_cost_per_token": None, "output_cost_per_token": None}),
             self.row("absent", "openai/third-model"),
         ]
-        self.assertEqual(pool.free_models(rows), set())
+        self.assertEqual(pool.declared_free_models(rows), set())
 
     def test_one_paid_deployment_makes_the_group_paid(self):
         # The router may reach any deployment of the group, so a mixed group is
@@ -157,13 +157,15 @@ class FreeModelsTest(unittest.TestCase):
             self.row("mixed", "openai/gpt-6-luna:free"),
             self.row("mixed", "openai/devin/gpt-6-luna"),
         ]
-        self.assertEqual(pool.free_models(rows), set())
+        self.assertEqual(pool.declared_free_models(rows), set())
 
     def test_an_operator_tag_can_mark_a_group_free(self):
         rows = [self.row("tagged", "openai/custom", {"tags": ["free"]})]
-        self.assertEqual(pool.free_models(rows), {"tagged"})
+        self.assertEqual(pool.declared_free_models(rows), {"tagged"})
         self.assertEqual(
-            pool.free_models([self.row("flagged", "openai/custom", {"is_free": True})]),
+            pool.declared_free_models(
+                [self.row("flagged", "openai/custom", {"is_free": True})]
+            ),
             {"flagged"},
         )
 
@@ -393,6 +395,41 @@ class ClassifierCandidateTest(unittest.TestCase):
         entries = pool.classifier_candidates(self.rows(), scores={"luna": 66.0})
         self.assertEqual(entries[1]["decision_index"], 66.0)
         self.assertNotIn("decision_index", entries[0])
+
+
+class FreeObservationTest(unittest.TestCase):
+    def row(self, name, free=False):
+        return {
+            "model_name": name,
+            "litellm_params": {"model": name + (":free" if free else "")},
+            "model_info": {"is_free": True} if free else {},
+        }
+
+    def test_a_measured_free_call_adds_a_single_deployment_group(self):
+        self.assertEqual(
+            pool.free_models([self.row("paid")], {"paid": {"free": True}}),
+            {"paid"},
+        )
+
+    def test_a_measured_paid_call_overrides_a_free_marker(self):
+        self.assertEqual(
+            pool.free_models([self.row("free", free=True)], {"free": {"free": False}}),
+            set(),
+        )
+
+    def test_one_free_call_does_not_make_a_multi_deployment_group_free(self):
+        rows = [self.row("mixed"), {**self.row("mixed"), "litellm_params": {"model": "x"}}]
+        self.assertEqual(pool.free_models(rows, {"mixed": {"free": True}}), set())
+
+    def test_a_marker_without_an_observation_is_not_free(self):
+        self.assertEqual(
+            pool.free_models([self.row("free", free=True)], {}), set()
+        )
+
+    def test_an_unknown_observation_is_not_free(self):
+        self.assertEqual(
+            pool.free_models([self.row("free", free=True)], {"free": None}), set()
+        )
 
 
 class SpecializedTest(unittest.TestCase):

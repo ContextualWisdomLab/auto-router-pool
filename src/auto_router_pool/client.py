@@ -219,13 +219,56 @@ def models(client: Client) -> list[dict]:
     return payload.get("data", [])
 
 
-def probe(client: Client, model: str):
-    """One-token round trip that must be served by ``model`` itself.
+def _number(value) -> float | None:
+    """A numeric usage field, tolerating providers that JSON-encode it as text."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
 
-    Returns ``(ok, reason)``. Any error (429/5xx/timeout), or a 200 answered by a
-    fallback, means the model cannot serve this run, so it drops out of the
-    candidates. Nothing is written to the catalogue, so the next run re-admits
-    the model as soon as it answers again.
+
+def usage_free(usage: dict | None) -> bool | None:
+    """Whether one completed call was billed as free, from its ``usage`` object.
+
+    LiteLLM returns ``usage.cost`` and ``cost_details`` for a zero-priced free
+    tier; OpenAI paid answers sometimes omit the cost fields entirely, while
+    OpenRouter and Anthropic include them. Only positive evidence is used: a
+    missing field is ``None`` (unknown), not paid. BYOK is not a free tier even
+    when the proxy's own cost is zero.
+    """
+    if not isinstance(usage, dict):
+        return None
+    if usage.get("is_byok") is True:
+        return False
+    details = usage.get("cost_details")
+    numbers = []
+    if isinstance(details, dict):
+        numbers = [number for value in details.values() if (number := _number(value)) is not None]
+    cost = _number(usage.get("cost"))
+    if cost is not None:
+        if cost > 0:
+            return False
+        if numbers and any(value > 0 for value in numbers):
+            return False
+        return True
+    if numbers:
+        return all(value == 0 for value in numbers)
+    return None
+
+
+def probe_with_usage(client: Client, model: str):
+    """``probe`` plus the free/paid signal from the probe's ``usage`` object.
+
+    The one-token probe is already the cheapest point at which the gateway
+    knows which deployment answered, so its usage is the right place to learn
+    whether a free tier was actually applied. ``observation`` is ``None`` when
+    the response carried no cost information.
     """
     result = client.post(
         "/v1/chat/completions",
@@ -238,9 +281,28 @@ def probe(client: Client, model: str):
     )
     status = result.get("error_status")
     if status is not None:
-        return False, f"unavailable_{status}"
+        return False, f"unavailable_{status}", None
     served = result.get("model")
     if served and served != model:
         # A fallback answer proves only that the fallback is alive.
-        return False, f"fallback_{served}"
-    return True, "ok"
+        return False, f"fallback_{served}", None
+    usage = result.get("usage")
+    observation = None
+    if isinstance(usage, dict):
+        observation = {
+            "free": usage_free(usage),
+            "cost": usage.get("cost"),
+        }
+    return True, "ok", observation
+
+
+def probe(client: Client, model: str):
+    """One-token round trip that must be served by ``model`` itself.
+
+    Returns ``(ok, reason)``. Any error (429/5xx/timeout), or a 200 answered by a
+    fallback, means the model cannot serve this run, so it drops out of the
+    candidates. Nothing is written to the catalogue, so the next run re-admits
+    the model as soon as it answers again.
+    """
+    ok, reason, _ = probe_with_usage(client, model)
+    return ok, reason
