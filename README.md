@@ -70,6 +70,15 @@ the same model at `max`.
    LLM judge that outlived a usable decision model as drift, so the switch happens
    on the next run and reverses when credits or an upstream disappear.
 
+   Priority is measured, not alphabetical. A model with an [Artificial Analysis
+   Decision Index](https://artificialanalysis.ai/decision-models/) score is
+   preferred over an unmeasured one and ranked by that score per **original**
+   input dollar; a free tier is compared at its paid
+   base's price, so zero price cannot manufacture a winner and only breaks a
+   tie. When a registration carries no price, the LiteLLM price map and then
+   the provider-route price recorded at registration fill it in. A model AA
+   does not score falls back to original input price and name.
+
    The *default* model -- the path a request takes when no tier is chosen -- has
    no `tier_model_configs` entry, so it answers at its own default effort rather
    than at the rung its best score was measured at. Candidates are ranked at

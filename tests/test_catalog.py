@@ -134,6 +134,10 @@ class PlanTest(unittest.TestCase):
             "gpt-6-luna-decisions", maker="OpenAI",
             description="served through POST /v1/decisions; not a chat or streaming model",
         )
+        luna["providers"][0].update({
+            "input_nano_usd_per_million": 100_000_000,
+            "output_nano_usd_per_million": 0,
+        })
         planned = catalog.plan(
             {"gpt-6-luna-decisions:free"}, {"gpt-6-luna-decisions": luna}, []
         )
@@ -143,6 +147,12 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(body["model_info"]["mode"], "decisions")
         self.assertTrue(body["model_info"]["is_free"])
         self.assertEqual(body["litellm_params"]["input_cost_per_token"], 0.0)
+        self.assertEqual(
+            body["model_info"]["original_input_cost_per_token"], 1e-07
+        )
+        self.assertEqual(
+            body["model_info"]["original_output_cost_per_token"], 0.0
+        )
 
     def test_an_authenticated_model_without_public_metadata_is_still_skipped(self):
         self.assertEqual(catalog.plan({"ghost"}, {}, []), [])

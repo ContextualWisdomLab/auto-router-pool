@@ -38,6 +38,67 @@ class ParseTest(unittest.TestCase):
             aa.parse_variants("<html>client side only</html>", "brand-2-sol")
 
 
+DECISION_HTML = (
+    '<p>Compared with other decision models, Clef is among the lowest scoring.</p>'
+    '<p>Clef scores 60.2 on the Artificial Analysis Decision Index, placing it low.</p>'
+    '<p>At 354 ms per task, Clef is notably slow.</p>'
+    '<p>On average, it costs $863 per 1M tasks to run Clef.</p>'
+    '<p>Pricing for Clef is $0.24 per 1M input tokens.</p>'
+)
+
+
+class DecisionPageTest(unittest.TestCase):
+    def test_the_decision_index_and_its_cost_are_parsed(self):
+        result = aa.parse_decision_page(DECISION_HTML)
+        self.assertEqual(result["score"], 60.2)
+        self.assertEqual(result["cost_per_million_tasks"], 863.0)
+        self.assertEqual(result["time_per_task_ms"], 354.0)
+        self.assertEqual(result["input_price_per_million"], 0.24)
+
+    def test_a_missing_score_is_a_layout_break(self):
+        with self.assertRaises(aa.LayoutError):
+            aa.parse_decision_page("<html>client side only</html>")
+
+    def test_gateway_names_map_to_aa_slugs(self):
+        self.assertEqual(aa.decision_slug("gpt-6-luna-decisions:free"),
+                         "gpt-6-luna-decisions")
+        self.assertEqual(aa.decision_slug("gpt-6-luna"), "gpt-6-luna-decisions")
+        self.assertEqual(aa.decision_slug("jev-latest"), "jev-1-14")
+
+
+class DecisionFetchTest(unittest.TestCase):
+    def test_scores_are_cached_by_slug(self):
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            return DECISION_HTML
+
+        cache = {}
+        first, errors = aa.get_decision_scores(["clef"], cache, fetch=fetch)
+        second, _ = aa.get_decision_scores(["clef"], cache, fetch=fetch)
+        self.assertEqual(errors, {})
+        self.assertEqual(first["clef"]["score"], 60.2)
+        self.assertEqual(second["clef"]["score"], 60.2)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_404_is_an_unscored_model_not_a_crash(self):
+        def fetch(url):
+            raise urllib.error.HTTPError(url, 404, "x", {}, None)
+        scores, errors = aa.get_decision_scores(["clef-flash"], {}, fetch=fetch)
+        self.assertEqual(scores, {})
+        self.assertEqual(errors, {"clef-flash": "no_aa_entry"})
+
+    def test_a_negative_score_is_retried_after_a_day(self):
+        cache = {"clef-flash": {"fetched": 0, "score": None,
+                                "error": "no_aa_entry"}}
+        scores, errors = aa.get_decision_scores(
+            ["clef-flash"], cache, fetch=lambda url: DECISION_HTML
+        )
+        self.assertEqual(errors, {})
+        self.assertEqual(scores["clef-flash"]["score"], 60.2)
+
+
 class NotFoundTest(unittest.TestCase):
     def fetch(self, code):
         def call(url):

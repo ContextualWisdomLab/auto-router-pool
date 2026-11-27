@@ -158,6 +158,92 @@ def is_decision(row: dict) -> bool:
     return any(word in text for word in DECISION_WORDS) and "not a chat" in text
 
 
+def _input_price(source: dict) -> float | None:
+    value = source.get("input_cost_per_token")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return None
+
+
+def _total_price(source: dict) -> float | None:
+    values = [
+        source.get("input_cost_per_token"),
+        source.get("output_cost_per_token"),
+    ]
+    known = [
+        float(value) for value in values
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    return sum(known) if known else None
+
+
+def model_price(row: dict, rows: list[dict], catalog: dict | None = None) -> float | None:
+    """Original input price per token, before any free-tier discount.
+
+    Registration is the first source, but it is not always complete: a free
+    variant deliberately records zero, and a guest may never have been priced.
+    The paid sibling of a free variant, the LiteLLM price map, and the provider
+    route price written at registration are tried in that order, so zero never
+    stands in for "unknown" and the free label never manufactures a winner.
+    """
+    info = row.get("model_info") or {}
+    params = row.get("litellm_params") or {}
+    for source in (info, params):
+        original = source.get("original_input_cost_per_token")
+        if isinstance(original, (int, float)) and not isinstance(original, bool):
+            return float(original)
+    own = _input_price(params)
+    if own is None:
+        own = _input_price(info)
+    if own is not None and (own > 0 or not declares_free(row)):
+        return own
+
+    name = row["model_name"]
+    base = name.removesuffix(":free")
+    if base != name:
+        siblings = [
+            candidate for candidate in rows
+            if candidate["model_name"] == base
+            and not declares_free(candidate)
+        ]
+        prices = [
+            price for candidate in siblings
+            if (price := _input_price(candidate.get("litellm_params") or {}))
+            and price > 0
+        ]
+        if prices:
+            return min(prices)
+
+    upstream = str(params.get("model") or "")
+    for entry in (catalog_entry(upstream, catalog), (catalog or {}).get(base)):
+        if not isinstance(entry, dict):
+            continue
+        price = _input_price(entry)
+        if price is None:
+            price = _total_price(entry)
+        if price is not None and price > 0:
+            return price
+    return own if own is not None and not declares_free(row) else None
+
+
+def decision_index(name: str, scores: dict | None) -> float | None:
+    """Measured Decision Index for a group, including its decision base."""
+    if not scores:
+        return None
+    base = name.removesuffix(":free")
+    keys = [name, base]
+    for suffix in ("-decisions", "-decision"):
+        if base.endswith(suffix):
+            keys.append(base[: -len(suffix)])
+    for key in keys:
+        value = scores.get(key)
+        if isinstance(value, dict):
+            value = value.get("score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
+
+
 def decision_models(rows: list[dict]) -> list[str]:
     """Groups that are decision models, reported instead of looking broken.
 
@@ -209,10 +295,15 @@ def supports_decisions(row: dict, catalog: dict | None = None) -> bool:
     info = row.get("model_info") or {}
     entry = catalog_entry((row.get("litellm_params") or {}).get("model") or "", catalog)
     if entry is not None:
-        if str(entry.get("mode") or "").lower() in DECISION_MODES:
+        mode = str(entry.get("mode") or "").lower()
+        if mode in DECISION_MODES:
             return True
         endpoints = [str(e).lower() for e in (entry.get("supported_endpoints") or [])]
-        return any(marker in " ".join(endpoints) for marker in DECISION_ENDPOINTS)
+        if mode or endpoints:
+            # An explicit non-decision mode or endpoint list is a verdict. A
+            # price-map row with only costs is not: it must not veto what the
+            # registration says, or an unpriced entry would drop the model.
+            return any(marker in " ".join(endpoints) for marker in DECISION_ENDPOINTS)
     if str(info.get("mode") or "").lower() in DECISION_MODES:
         return True
     endpoints = [str(e).lower() for e in (info.get("supported_endpoints") or [])]
@@ -242,12 +333,14 @@ def decision_catalog(catalog: dict | None) -> list[dict]:
     return out
 
 
-def classifier_candidates(rows: list[dict], catalog: dict | None = None) -> list[dict]:
+def classifier_candidates(rows: list[dict], catalog: dict | None = None,
+                          scores: dict | None = None) -> list[dict]:
     """Every group that can answer a decision request, and whether it can now.
 
     A decision model is reported as ``exclusive``; a chat model that also serves
     ``/v1/decisions`` is reported too, because it can classify even though it
-    must never fill a tier.
+    must never fill a tier. A measured Decision Index is carried along so the
+    summary shows what the ordering was based on.
     """
     groups: dict[str, list[dict]] = {}
     for row in rows:
@@ -257,25 +350,34 @@ def classifier_candidates(rows: list[dict], catalog: dict | None = None) -> list
     for name, group in sorted(groups.items()):
         if not any(supports_decisions(row, catalog) for row in group):
             continue
-        out.append({
+        entry = {
             "model": name,
             "exclusive": name in only,
             "usable": any(
                 not (row.get("model_info") or {}).get("blocked") for row in group
             ),
-        })
+        }
+        measured = decision_index(name, scores)
+        if measured is not None:
+            entry["decision_index"] = round(measured, 1)
+        out.append(entry)
     return out
 
 
-def decision_candidates(rows: list[dict], catalog: dict | None = None) -> list[str]:
+def decision_candidates(rows: list[dict], catalog: dict | None = None,
+                        scores: dict | None = None) -> list[str]:
     """Every decision-capable group with an unblocked deployment, in preference order.
 
     The router asks one question -- which tier -- and a decision endpoint answers
     that in one cheap forward pass instead of a chat completion. Models that are
     only decisions come first; a chat model that also serves decisions is the
-    second choice. The 272k solver floor does not apply: the classifier reads a
-    short prompt, not the request, so its window cannot bound what the router
-    advertises.
+    second choice. Inside each class, a measured Artificial Analysis Decision
+    Index score beats an unmeasured model, and measured models are ordered by
+    score per original input dollar. A free tier is priced at its paid base, so
+    zero price cannot manufacture a winner; only an equal value lets the
+    actually-free deployment break the tie. Unmeasured models fall back to
+    original input price, then name. The 272k solver floor does not apply: the
+    classifier reads a short prompt, not the request.
     """
     groups: dict[str, list[dict]] = {}
     for row in rows:
@@ -286,12 +388,36 @@ def decision_candidates(rows: list[dict], catalog: dict | None = None) -> list[s
         if any(supports_decisions(row, catalog) for row in group)
         and any(not (row.get("model_info") or {}).get("blocked") for row in group)
     ]
-    return sorted(capable, key=lambda name: (name not in only, name))
+
+    def rank(name: str):
+        group = groups[name]
+        exclusive = name not in only
+        measured = decision_index(name, scores)
+        prices = [model_price(row, rows, catalog) for row in group]
+        known = [price for price in prices if price is not None]
+        price = min(known) if known else None
+        free = any(declares_free(row) for row in group)
+        unknown_price = price is None
+        if measured is not None:
+            value = measured / price if price and price > 0 else measured
+            return (
+                exclusive, 0, -value, -measured,
+                unknown_price, 0 if free else 1,
+                price if price is not None else float("inf"), name,
+            )
+        return (
+            exclusive, 1, 0.0, 0.0,
+            unknown_price, 0 if free else 1,
+            price if price is not None else float("inf"), name,
+        )
+
+    return sorted(capable, key=rank)
 
 
-def decision_classifier(rows: list[dict], catalog: dict | None = None) -> str | None:
+def decision_classifier(rows: list[dict], catalog: dict | None = None,
+                        scores: dict | None = None) -> str | None:
     """The first decision model this gateway could use as its classifier."""
-    candidates = decision_candidates(rows, catalog)
+    candidates = decision_candidates(rows, catalog, scores)
     return candidates[0] if candidates else None
 
 

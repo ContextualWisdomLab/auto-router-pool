@@ -691,8 +691,31 @@ def run(args) -> int:
     # actually does, so each candidate is tried until one returns a real choice.
     # A decision model that fails its probe must not take the whole classifier
     # down when a sibling can still answer.
+    # AA's Decision Index is the performance source: it scores decision-only
+    # models on the same task shape the classifier asks, which the chat model
+    # pages cannot. Missing scores are not fatal; price still orders those.
+    decision_cache_path = settings.home / "auto-pool-decision-cache.json"
+    decision_cache = load_json(decision_cache_path)
+    capable = [
+        item["model"] for item in classifier_candidates(rows, catalog)
+        if item["usable"]
+    ]
+    decision_scores: dict[str, float] = {}
+    if capable:
+        benchmark, benchmark_errors = aa.get_decision_scores(
+            capable, decision_cache,
+            ttl=settings.aa_ttl, force=args.refresh_scores,
+        )
+        decision_scores = {
+            name: entry["score"] for name, entry in benchmark.items()
+            if entry.get("score") is not None
+        }
+        decision_cache_path.write_text(json.dumps(decision_cache))
+        for name, reason in benchmark_errors.items():
+            status.setdefault(name, f"benchmark_{reason}")
+
     decision = None
-    for candidate in decision_candidates(rows, catalog):
+    for candidate in decision_candidates(rows, catalog, decision_scores):
         ok, reason = probe_decision_choice(litellm, candidate)
         if ok:
             decision = candidate
@@ -738,7 +761,9 @@ def run(args) -> int:
         "budget_quarantine": budget_quarantine,
         # Every group that could classify if it answered: a decision-only model,
         # or a chat model that also serves /v1/decisions.
-        "classifier_candidates": classifier_candidates(rows, catalog),
+        "classifier_candidates": classifier_candidates(
+            rows, catalog, decision_scores
+        ),
         # The catalogue's own decision models: what to look for (and register)
         # when no deployed deployment can classify yet.
         "decision_catalog": decision_catalog(catalog),

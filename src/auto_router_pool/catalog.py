@@ -321,6 +321,15 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
             ),
             "availability": "authenticated Experiential Labs catalog",
         }
+        if (
+            free
+            and isinstance(in_nano, int) and not isinstance(in_nano, bool)
+            and isinstance(out_nano, int) and not isinstance(out_nano, bool)
+        ):
+            # A free tier is the same model as its base; keep the list price so
+            # priority can compare it without treating zero as a real price.
+            info["original_input_cost_per_token"] = in_nano / 1e15
+            info["original_output_cost_per_token"] = out_nano / 1e15
         if endpoints:
             info["supported_endpoints"] = endpoints
         for field in ("max_input_tokens", "max_output_tokens"):

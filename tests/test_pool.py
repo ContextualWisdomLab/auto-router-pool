@@ -389,6 +389,11 @@ class ClassifierCandidateTest(unittest.TestCase):
     def test_the_unblocked_capable_model_wins(self):
         self.assertEqual(pool.decision_classifier(self.rows()), "luna")
 
+    def test_a_measured_index_is_reported(self):
+        entries = pool.classifier_candidates(self.rows(), scores={"luna": 66.0})
+        self.assertEqual(entries[1]["decision_index"], 66.0)
+        self.assertNotIn("decision_index", entries[0])
+
 
 class DecisionCatalogTest(unittest.TestCase):
     CATALOG = {
@@ -433,3 +438,50 @@ class DecisionCandidateOrderTest(unittest.TestCase):
         rows = self.rows()
         rows[1]["model_info"]["blocked"] = True
         self.assertEqual(pool.decision_candidates(rows), ["jev", "luna"])
+
+
+class DecisionPriorityTest(unittest.TestCase):
+    def row(self, name, cost=None, free=False, upstream=None):
+        params = {"model": upstream or name}
+        if cost is not None:
+            params["input_cost_per_token"] = cost
+            params["output_cost_per_token"] = 0.0
+        info = {"id": name, "mode": "decisions", "blocked": False}
+        if free:
+            info["is_free"] = True
+        return {"model_name": name, "litellm_params": params, "model_info": info}
+
+    def test_a_measured_score_beats_a_cheaper_unmeasured_model(self):
+        rows = [self.row("cheap", cost=1e-7), self.row("strong", cost=2e-6)]
+        self.assertEqual(
+            pool.decision_candidates(rows, scores={"strong": 66.0}),
+            ["strong", "cheap"],
+        )
+
+    def test_price_breaks_ties_between_unmeasured_models(self):
+        rows = [self.row("expensive", cost=2e-7), self.row("cheap", cost=1e-7)]
+        self.assertEqual(pool.decision_candidates(rows), ["cheap", "expensive"])
+
+    def test_a_free_tier_is_compared_at_its_base_price_and_wins_a_tie(self):
+        rows = [self.row("m", cost=1e-7), self.row("m:free", cost=0.0, free=True)]
+        self.assertEqual(
+            pool.decision_candidates(rows, scores={"m": 66.0, "m:free": 66.0}),
+            ["m:free", "m"],
+        )
+
+    def test_a_free_tier_without_a_base_price_is_not_preferred(self):
+        rows = [
+            self.row("paid", cost=1e-7),
+            self.row("ghost:free", cost=0.0, free=True),
+        ]
+        self.assertEqual(pool.decision_candidates(rows), ["paid", "ghost:free"])
+
+    def test_the_litellm_price_map_prices_an_unpriced_model(self):
+        rows = [
+            self.row("unpriced", upstream="typesafe/jev-1.13"),
+            self.row("priced", cost=2e-7),
+        ]
+        catalog = {"typesafe/jev-1.13": {"input_cost_per_token": 1e-7}}
+        self.assertEqual(
+            pool.decision_candidates(rows, catalog), ["unpriced", "priced"]
+        )
