@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import aa
-from .assign import SPREAD, place, schedule
+from .assign import SPREAD, place, roles, schedule
 from .apply import apply as apply_changes
 from .apply import (
     backup,
@@ -37,10 +37,7 @@ from .pool import (
     flaky_deployments,
     group_state,
     input_window,
-    pick,
     pick_micro,
-    pick_primary,
-    score,
     score_hashes,
     stable_deployments,
 )
@@ -404,28 +401,20 @@ def run(args) -> int:
     updates = changed_scores(hashes, previous_scores)
     cache_path.write_text(json.dumps(cache))
 
-    premium = pick(candidates, "xhigh", 12, 45)
-    primary = pick_primary(candidates)
-    budget = pick(candidates, "medium", 0.30, 1.50, mode="value")
+    # Roles are solved, not capped: the cheapest model that reaches each role's
+    # measured floor wins, so no price is written into the policy.
+    assigned = roles(candidates)
+    premium = assigned["premium"]
+    primary = assigned["primary"]
+    budget = assigned["budget"]
     if not (premium and primary and budget):
         print(json.dumps({"error": "insufficient valid candidates", "status": status}))
         return 1
-
-    eligible = sorted(
-        (
-            (name, score(variants, "high"))
-            for name, variants in candidates.items()
-            if score(variants, "high")
-            and score(variants, "high")[2]["in"] <= 3
-            and score(variants, "high")[2]["out"] <= 12
-        ),
-        key=lambda item: item[1][0],
-        reverse=True,
-    )
-    runner_up = next((name for name, _ in eligible if name != primary[0]), None)
+    runner_up = assigned["runner_up"]
     if not runner_up:
         print(json.dumps({"error": "no runner-up candidate", "status": status}))
         return 1
+    runner_up = runner_up[0]
 
     # Light tiers need small models; by default they come from the pool itself,
     # so nothing has to be named on the command line. ``--micro`` stays as an

@@ -27,16 +27,23 @@ the same model at `max`.
    soon as it answers. A model below the 272k floor is never a candidate or a
    `--micro` entry.
 3. **Fetch scores** from the Artificial Analysis model page, cached per slug.
-4. **Pick roles** under price caps:
+4. **Solve roles** as a linear program over the measured ladders
+   (`assign.roles`): minimise the blended price of the four roles subject to each
+   role reaching a floor taken from the roster itself.
 
-   | role | rule | cap (per 1M in/out) |
+   | role | floor (measured index) | effort |
    |---|---|---|
-   | `premium` | best index at `xhigh` | $12 / $45 |
-   | `primary` | within 2 points of the best at `high`, prefer models without the `-astra` suffix, then lowest price | $3 / $12 |
-   | `budget` | best index per blended dollar at `medium` | $0.30 / $1.50 |
+   | `premium` | within 1 point of the best | `xhigh` |
+   | `primary` | within 2 points, and not the premium model | `high` |
+   | `runner_up` | within 6 points, and neither of the two above | `high` |
+   | `budget` | no floor: best index per blended dollar | `medium` |
 
-   `micro` is not chosen by a cap: it is the two cheapest candidates the run
-   already proved usable, at `low`, so the light tiers need no supplied list.
+   No price is written into the policy. The cheapest model that still clears its
+   floor wins, so a price change cannot silently demote a role, and a thin
+   catalogue reuses the previous role instead of failing the run.
+
+   `micro` is not chosen by a floor either: it is the two cheapest candidates the
+   run already proved usable, at `low`, so the light tiers need no supplied list.
 
    The complexity classifier is pinned to the `runner_up` model with a 30s
    timeout. It runs on every routed request, so it must be a model the router

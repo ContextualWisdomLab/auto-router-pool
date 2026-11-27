@@ -93,52 +93,6 @@ def score(variants: dict, effort: str):
     return entry["index"], entry["index"] / blended, entry
 
 
-def pick(
-    candidates: dict[str, dict],
-    effort: str,
-    max_in: float,
-    max_out: float,
-    *,
-    mode: str = "quality",
-    tolerance: float = 2.0,
-    deprioritize_suffix: str | None = None,
-):
-    """Choose a model under a price cap.
-
-    ``quality`` maximises the index and then prefers the cheapest option within
-    ``tolerance`` points, which keeps a marginal +0.5 from buying a 4x price.
-    ``value`` maximises index per blended dollar.
-    """
-    scored = []
-    for name, variants in candidates.items():
-        result = score(variants, effort)
-        if not result:
-            continue
-        index, value, entry = result
-        if entry["in"] > max_in or entry["out"] > max_out:
-            continue
-        scored.append((name, index, value, (entry["in"] + entry["out"]) / 2, entry))
-    if not scored:
-        return None
-    if mode == "value":
-        best = max(scored, key=lambda item: item[2])
-    else:
-        top = max(item[1] for item in scored)
-        best = min(
-            (item for item in scored if item[1] >= top - tolerance),
-            key=lambda item: (
-                deprioritize_suffix is not None
-                and item[0].lower().endswith(deprioritize_suffix),
-                item[3],
-            ),
-        )
-    return best[0], best[2], best[1], best[4]
-
-
-def pick_primary(candidates: dict[str, dict]):
-    return pick(candidates, "high", 3, 12, deprioritize_suffix="-astra")
-
-
 def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: str = "low"):
     """Cheapest remaining candidates, so light tiers need no supplied list.
 

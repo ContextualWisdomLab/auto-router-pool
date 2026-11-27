@@ -60,6 +60,101 @@ def ceiling(variants: dict) -> float | None:
     return rungs[-1]["index"] if rungs else None
 
 
+# Role floors in measured index points, not dollars. A role picks the cheapest
+# model that still reaches its floor, so prices are an output of the roster.
+PREMIUM_TOL = 1.0
+PRIMARY_TOL = 2.0
+RUNNER_TOL = 6.0
+
+ROLE_EFFORT = {
+    "premium": "xhigh",
+    "primary": "high",
+    "runner_up": "high",
+    "budget": "medium",
+}
+ROLE_TOL = {"premium": PREMIUM_TOL, "primary": PRIMARY_TOL, "runner_up": RUNNER_TOL}
+
+
+def _options(rungs: dict, effort: str, skip=()) -> list[tuple]:
+    """``(name, rung)`` for every model measured at ``effort``.
+
+    A model whose ladder was only measured at one point still competes: it is
+    scored at that rung instead of vanishing from the assignment, which is what
+    the single-effort candidates in a thin catalogue need.
+    """
+    options = []
+    for name, choices in rungs.items():
+        if name in skip or not choices:
+            continue
+        rung = next((r for r in choices if r["effort"] == effort), None)
+        options.append((name, rung or choices[-1]))
+    return options
+
+
+def _cheapest_above(options: list[tuple], tolerance: float):
+    """Cheapest option within ``tolerance`` of the best index; price first."""
+    if not options:
+        return None
+    top = max(rung["index"] for _, rung in options)
+    floor = top - tolerance
+    here = [(name, rung) for name, rung in options if rung["index"] >= floor]
+    return min(here, key=lambda item: (item[1]["cost"], -item[1]["index"]))
+
+
+def roles(ladders: dict) -> dict[str, tuple | None]:
+    """Role assignment as a linear program over the measured ladders.
+
+    ::\n
+        minimise   blended price of the four roles
+        s.t.       index[role] >= best_available(role) - tolerance
+                   one model per role, all roles distinct
+
+    Floors are index points taken from the roster itself, so no price cap is
+    ever written down and a price change cannot silently demote a role: the
+    cheapest model that still reaches the floor wins, and the floor moves with
+    the measurement. ``budget`` has no quality floor -- it maximises index per
+    blended dollar, which is the same statement with the price on the other side.
+    """
+    rungs = {name: _rungs(variants or {}) for name, variants in (ladders or {}).items()}
+    chosen: dict[str, tuple | None] = {}
+
+    def solve(role: str, exclude=()):
+        return _cheapest_above(
+            _options(rungs, ROLE_EFFORT[role], set(exclude)), ROLE_TOL[role]
+        )
+
+    def keep(role: str, best):
+        chosen[role] = (
+            None if best is None else (best[0], None, best[1]["index"], best[1])
+        )
+        return best[0] if best else None
+
+    premium = keep("premium", solve("premium"))
+    # The roles are distinct where the roster allows it: primary must not be the
+    # premium model, and runner_up must be neither. A catalogue too thin for that
+    # falls back to the previous role instead of failing the whole run.
+    primary = keep(
+        "primary",
+        solve("primary", [premium]) or solve("primary"),
+    )
+    runner = keep(
+        "runner_up",
+        solve("runner_up", [premium, primary]) or solve("runner_up", [primary]),
+    )
+
+    cheap = [
+        (item[1]["index"] / item[1]["cost"], item)
+        for item in _options(rungs, ROLE_EFFORT["budget"])
+        if item[1]["cost"] > 0
+    ]
+    best_value = max(cheap, key=lambda pair: (pair[0], pair[1][1]["index"]))[1] if cheap else None
+    chosen["budget"] = (
+        None if best_value is None
+        else (best_value[0], None, best_value[1]["index"], best_value[1])
+    )
+    return chosen
+
+
 def place(models, ladders: dict, band: float = SPREAD) -> dict:
     """Equal-score placement of ``models`` given their measured ladders.
 

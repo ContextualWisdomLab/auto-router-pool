@@ -8,16 +8,6 @@ VARIANTS = {
     "medium": {"index": 52.7, "in": 2, "out": 10},
 }
 
-CANDIDATES = {
-    "model-primary": VARIANTS,
-    "model-premium": {
-        "xhigh": {"index": 61.6, "in": 8, "out": 40},
-        "high": {"index": 60.1, "in": 8, "out": 40},
-    },
-    "model-budget": {"medium": {"index": 18.5, "in": 0.1, "out": 0.5}},
-}
-
-
 class ScoreTest(unittest.TestCase):
     def test_missing_effort_falls_back_to_max(self):
         index, value, entry = pool.score(VARIANTS, "xhigh")
@@ -44,33 +34,6 @@ class DeploymentFlakinessTest(unittest.TestCase):
             "unknown": ["unknown", "unknown", "unknown"],
         }
         self.assertEqual(pool.stable_deployments(samples), {"healthy"})
-
-
-class PickTest(unittest.TestCase):
-    def test_primary_prefers_non_astra_within_quality_tolerance(self):
-        candidates = {
-            "brand-astra": {"high": {"index": 60, "in": 1, "out": 5}},
-            "brand-sol": {"high": {"index": 58, "in": 2, "out": 10}},
-        }
-        self.assertEqual(pool.pick_primary(candidates)[0], "brand-sol")
-        self.assertEqual(pool.pick(candidates, "high", 3, 12)[0], "brand-astra")
-        candidates["brand-sol"]["high"]["index"] = 57.9
-        self.assertEqual(pool.pick_primary(candidates)[0], "brand-astra")
-
-    def test_quality_prefers_index_but_breaks_ties_on_price(self):
-        chosen = pool.pick(CANDIDATES, "high", 12, 45)
-        self.assertEqual(chosen[0], "model-premium")
-
-    def test_quality_honours_price_cap(self):
-        chosen = pool.pick(CANDIDATES, "high", 3, 12)
-        self.assertEqual(chosen[0], "model-primary")
-
-    def test_value_prefers_index_per_dollar(self):
-        chosen = pool.pick(CANDIDATES, "medium", 0.3, 1.5, mode="value")
-        self.assertEqual(chosen[0], "model-budget")
-
-    def test_no_candidate_under_cap(self):
-        self.assertIsNone(pool.pick(CANDIDATES, "high", 1, 1))
 
 
 class FingerprintTest(unittest.TestCase):

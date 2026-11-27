@@ -94,6 +94,54 @@ class FrontierTest(unittest.TestCase):
         self.assertEqual(frontier, [("astra", "max"), ("sol", "xhigh"), ("old", "xhigh")])
 
 
+class RolesTest(unittest.TestCase):
+    def setUp(self):
+        def priced(pairs, cost):
+            return {
+                effort: {"index": index, "in": cost[0], "out": cost[1]}
+                for effort, index in pairs.items()
+            }
+
+        self.ladders = {
+            "astra": ASTRA, "sol": SOL, "old": OLD_SOL,
+            "budget": priced(
+                {"low": 9.7, "medium": 18.5, "high": 21.4, "max": 27.9}, (0.1, 0.5)
+            ),
+            "opus": priced(
+                {"medium": 48.26, "high": 51.79, "xhigh": 57.52, "max": 59.12},
+                (4, 20),
+            ),
+        }
+
+    def test_solves_each_role_without_a_price_cap(self):
+        chosen = assign.roles(self.ladders)
+        self.assertEqual(chosen["premium"][0], "astra")
+        self.assertEqual(chosen["premium"][3]["effort"], "xhigh")
+        self.assertEqual(chosen["primary"][0], "sol")
+        self.assertEqual(chosen["runner_up"][0], "old")
+        self.assertEqual(chosen["budget"][0], "budget")
+
+    def test_roles_never_reuse_a_model(self):
+        chosen = assign.roles(self.ladders)
+        names = [chosen[role][0] for role in ("premium", "primary", "runner_up", "budget")]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_cheapest_model_inside_the_floor_wins(self):
+        cheap = {"max": {"index": 56.5, "in": 1, "out": 2}}
+        dear = {"max": {"index": 57.0, "in": 9, "out": 36}}
+        chosen = assign.roles({"cheap": cheap, "dear": dear, "other": ladder(max=50.0)})
+        # Both reach the premium floor; the cheaper one takes the role.
+        self.assertEqual(chosen["premium"][0], "cheap")
+
+    def test_single_effort_ladder_still_competes(self):
+        chosen = assign.roles({"only": ladder(low=9.0)})
+        self.assertEqual(chosen["premium"][0], "only")
+        self.assertEqual(chosen["budget"][0], "only")
+
+    def test_empty_roster_assigns_nothing(self):
+        self.assertEqual(set(assign.roles({}).values()), {None})
+
+
 class GrowTest(unittest.TestCase):
     def test_pads_a_tier_with_same_score_fallbacks(self):
         tier_map = {"frontier": [("old", "max")]}
