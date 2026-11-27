@@ -40,12 +40,12 @@ the same model at `max`.
    to `mode: batch`. This stage never writes block flags:
    `--quarantine` owns those, because a probe can prove a deployment dead but an
    account's exhausted credit is not provable from one deployment.
-2. **Filter to valid models**: a declared input window of at least 272,000
+2. **Filter to valid models**: a declared input window of at least 128,000
    tokens, at least one unblocked deployment, and a one-token probe answered by
    the model itself. Any error (`400`/`429`/`5xx`/timeout) or an answer produced
    by a fallback means the model cannot serve this run, so it is not a candidate.
    Nothing is written to the catalogue, so the next run re-admits the model as
-   soon as it answers. A model below the 272k floor is never a candidate or a
+   soon as it answers. A model below the 128k floor is never a candidate or a
    `--micro` entry.
 3. **Fetch scores** from the Artificial Analysis model page, cached per slug.
 4. **Solve roles** as a linear program over the measured ladders
@@ -118,7 +118,7 @@ the same model at `max`.
    server-side, back up, patch, re-read, and roll back on any mismatch.
 6. **Cap the advertised window** at the smallest `max_input_tokens` among the
    models its own tiers can select, so a router never advertises more context
-   than the weakest solver it can hand a request to. Only models at or above the 272k input floor can be selected, so the advertised
+   than the weakest solver it can hand a request to. Only models at or above the 128k input floor can be selected, so the advertised
    window lands on the weakest *eligible* solver. A solver with no declared
    window proves no floor, so that router is left alone instead of guessed.
 
@@ -134,7 +134,7 @@ a host schedules one entry point instead of a directory of scripts:
 | `--sync-catalog` | register missing Experiential models (inside the pool run) |
 | `--sync-batch` | register public batch models as `mode: batch` |
 | `--sync-catalogs` | Cursor Cloud snapshot, Cursor chat bases, Anthropic official models, CLIProxyAPI `gemini-4-argon` |
-| `--maintenance` | add `prompt_cache_key` to the drop list of providers that refuse it |
+| `--maintenance` | keep drop lists, provider prefixes, context windows, effort suffixes, and chat-only transports (`hosted_vllm/`) repaired |
 | `--repair-cooldowns` | cap pooled bridge cooldowns at 30s and clear one only after two real answers |
 | `--health-report` | write a bounded per-deployment health report |
 
@@ -338,7 +338,7 @@ Use `--refresh-scores` to re-read everything on demand.
 ## Chain hygiene
 
 `auto-router-pool-chains` keeps `fallbacks` usable on its own schedule: it drops
-targets that are blocked or below the 272k floor, ends every chain on a live
+targets that are blocked or below the 128k floor, ends every chain on a live
 resort, and never lets the resort keep a chain of its own (which could close a
 cycle). The resort is chosen from the catalogue — the cheapest model from a
 family the auto tiers do not already use — and an incumbent keeps the role while

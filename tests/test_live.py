@@ -46,7 +46,7 @@ class ChooseTerminalTest(unittest.TestCase):
         self.assertEqual(chosen, "gemini-3.8-flash")
 
     def test_window_below_the_pool_floor_is_rejected(self):
-        rows = [row("gemini-3.8-flash", window=131072), row("gemini-3.8-flash", window=131072)]
+        rows = [row("gemini-3.8-flash", window=65536), row("gemini-3.8-flash", window=65536)]
         self.assertEqual(live.choose_terminal(rows, PRICES, set()), (None, {}))
 
     def test_a_solver_is_never_the_terminal(self):
@@ -121,7 +121,7 @@ class SanitizeTest(unittest.TestCase):
         self.assertEqual(first["fallbacks"], second["fallbacks"])
 
     def test_targets_below_the_floor_are_stripped(self):
-        rows = self.rows() + [row("laguna-xs-2.1", window=131072)]
+        rows = self.rows() + [row("laguna-xs-2.1", window=65536)]
         settings = {"fallbacks": [{"gpt-6.2-sol": ["gemini-3.8-flash", "laguna-xs-2.1"]}]}
         result = live.sanitize(rows, settings, PRICES)
         self.assertEqual(live.edges_from(result["fallbacks"])["gpt-6.2-sol"],

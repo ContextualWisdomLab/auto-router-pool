@@ -2,7 +2,7 @@
 
 The resort is never hardcoded: it is the cheapest model from a family the auto
 tiers do not already use, with an unblocked deployment and a window above the
-272k pool floor. An incumbent keeps the role while it still qualifies, so a
+128k pool floor. An incumbent keeps the role while it still qualifies, so a
 harmless price change cannot churn the graph. No inference is performed.
 """
 from __future__ import annotations
@@ -53,7 +53,7 @@ def group_facts(rows: list[dict]) -> dict[str, dict]:
 
 
 def usable(name: str, facts: dict) -> bool:
-    """A target must be routable at all: live and above the 272k floor."""
+    """A target must be routable at all: live and above the 128k floor."""
     fact = facts.get(name)
     return bool(fact and fact["unblocked"] > 0 and fact["window"] >= MIN_INPUT_TOKENS)
 

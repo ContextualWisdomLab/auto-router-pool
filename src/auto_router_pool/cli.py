@@ -42,6 +42,7 @@ from .catalog import sync as sync_catalog
 from .catalog import sync_batch
 from .extra_catalogs import sync_all as sync_provider_catalogs
 from .maintenance import (
+    chat_only_transport_pass,
     context_sync_pass,
     effort_suffix_pass,
     health_report,
@@ -418,6 +419,9 @@ def run(args) -> int:
             )
             output["effort_suffix"] = effort_suffix_pass(
                 litellm, rows, prices, apply=args.apply
+            )
+            output["chat_only_transport"] = chat_only_transport_pass(
+                litellm, rows, apply=args.apply
             )
         if args.repair_cooldowns:
             output["cooldowns"] = repair_cooldowns(

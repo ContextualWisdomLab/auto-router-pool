@@ -104,10 +104,10 @@ class ContextFloorTest(unittest.TestCase):
         self.assertEqual(pool.input_window([{"model_name": "m", "model_info": {}}], "m"), 0)
 
     def test_smaller_than_floor_is_unusable(self):
-        self.assertEqual(pool.group_state(self.rows(131072), "m"), (False, "context_below_floor"))
+        self.assertEqual(pool.group_state(self.rows(65536), "m"), (False, "context_below_floor"))
 
     def test_floor_is_inclusive(self):
-        self.assertTrue(pool.group_state(self.rows(272000), "m")[0])
+        self.assertTrue(pool.group_state(self.rows(128000), "m")[0])
 
     def test_custom_floor(self):
         self.assertEqual(

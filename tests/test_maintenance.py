@@ -147,5 +147,82 @@ class HealthTest(unittest.TestCase):
         self.assertEqual(report["summary"], summary)
 
 
+class ChatOnlyTransportTest(unittest.TestCase):
+    def test_rewrites_nvidia_openai_deployments_to_hosted_vllm(self):
+        nvidia_row = row(
+            "minimax-m3.1-flash", "n1",
+            model="openai/minimaxai/minimax-m3.1-flash",
+            api_base="https://integrate.api.nvidia.com/v1",
+        )
+        glm_row = row(
+            "glm-5.3-flash", "n2",
+            model="openai/z-ai/glm-5.3-flash",
+            custom_llm_provider="openai",
+            api_base="https://integrate.api.nvidia.com/v1",
+        )
+        glm_row["model_info"]["litellm_provider"] = "openai"
+        already_fixed = row(
+            "mistral-large-4", "n3",
+            model="hosted_vllm/mistralai/mistral-large-4-1t-a52b",
+            custom_llm_provider="hosted_vllm",
+            api_base="https://integrate.api.nvidia.com/v1",
+        )
+        openai_row = row(
+            "gpt-5.5", "o1",
+            model="openai/gpt-5.5",
+            custom_llm_provider="openai",
+            api_base="https://api.openai.com/v1",
+        )
+        client = FakeClient()
+        changes = maintenance.chat_only_transport_pass(
+            client, [nvidia_row, glm_row, already_fixed, openai_row], apply=True
+        )
+        self.assertEqual(changes, [
+            {
+                "model": "minimax-m3.1-flash", "deployment": "n1",
+                "action": "updated",
+                "from": "openai/minimaxai/minimax-m3.1-flash",
+                "to": "hosted_vllm/minimaxai/minimax-m3.1-flash",
+            },
+            {
+                "model": "glm-5.3-flash", "deployment": "n2",
+                "action": "updated",
+                "from": "openai/z-ai/glm-5.3-flash",
+                "to": "hosted_vllm/z-ai/glm-5.3-flash",
+            },
+        ])
+        self.assertEqual(client.calls, [
+            (
+                "PATCH", "/model/n1/update",
+                {"litellm_params": {
+                    "model": "hosted_vllm/minimaxai/minimax-m3.1-flash",
+                    "custom_llm_provider": "hosted_vllm",
+                }},
+            ),
+            (
+                "PATCH", "/model/n2/update",
+                {
+                    "litellm_params": {
+                        "model": "hosted_vllm/z-ai/glm-5.3-flash",
+                        "custom_llm_provider": "hosted_vllm",
+                    },
+                    "model_info": {"litellm_provider": "hosted_vllm"},
+                },
+            ),
+        ])
+
+    def test_preview_writes_nothing(self):
+        rows = [row(
+            "minimax-m3.1-flash", "n1",
+            model="openai/minimaxai/minimax-m3.1-flash",
+            api_base="https://integrate.api.nvidia.com/v1",
+        )]
+        client = FakeClient()
+        changes = maintenance.chat_only_transport_pass(client, rows)
+        self.assertEqual(changes[0]["action"], "would_update")
+        self.assertEqual(changes[0]["to"], "hosted_vllm/minimaxai/minimax-m3.1-flash")
+        self.assertEqual(client.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
