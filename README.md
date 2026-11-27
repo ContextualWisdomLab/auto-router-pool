@@ -19,6 +19,15 @@ the same model at `max`.
    LiteLLM's own `/model/info` by default, so no extra service is required; a
    separate catalogue proxy (CLIProxyAPI) is used only when `CPAPI_API_KEY` is
    set, which keeps `/v1/models` authoritative for setups that prefer it.
+   With `--sync-catalog` the upstream Experiential Labs catalogue is read first
+   and every active text model the account can call is registered if it is
+   missing. A model routed by any provider is eligible, not only ones served by
+   `experiential_cloud`, so a new model appears without a separate cron. A model
+   the catalogue describes as a decision model (`/v1/systemone`) is registered on
+   the native SystemOne transport instead of the OpenAI chat one, which would
+   send `/v1/decisions` and be refused. This stage never writes block flags:
+   `--quarantine` owns those, because a probe can prove a deployment dead but an
+   account's exhausted credit is not provable from one deployment.
 2. **Filter to valid models**: a declared input window of at least 272,000
    tokens, at least one unblocked deployment, and a one-token probe answered by
    the model itself. Any error (`400`/`429`/`5xx`/timeout) or an answer produced

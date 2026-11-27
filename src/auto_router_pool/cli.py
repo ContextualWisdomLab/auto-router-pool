@@ -37,6 +37,7 @@ from .client import (
     probe_decision_choice,
 )
 from .apply import DECISION_CLASSIFIER
+from .catalog import sync as sync_catalog
 from .pool import (
     MIN_INPUT_TOKENS,
     changed_scores,
@@ -317,6 +318,10 @@ def parse_args(argv=None):
         help="probe the routers' models and align their block flags with the answer",
     )
     parser.add_argument(
+        "--sync-catalog", action="store_true",
+        help="register upstream catalogue models the gateway does not carry yet",
+    )
+    parser.add_argument(
         "--prices", type=Path, default=None,
         help="pinned LiteLLM price map for --live-fallbacks",
     )
@@ -385,6 +390,18 @@ def run(args) -> int:
             catalog = json.loads(Path(catalog_path).read_text())
     except (OSError, ValueError):
         catalog = {}
+
+    # A model missing from the registry is invisible to the router, and the
+    # upstream catalogue is the only place a new one exists. Registration is
+    # separate from the block sweep: only a probe can prove a deployment dead,
+    # while an account's credit cannot be proven from one deployment.
+    catalog_sync = None
+    if args.sync_catalog:
+        catalog_sync = sync_catalog(
+            litellm, rows, settings.home, prices=catalog, apply=args.apply
+        )
+        if args.apply and catalog_sync.get("actions"):
+            rows = models(litellm)  # the new groups are routable from here on
 
     # Guests are models the operator can use that no catalogue sync carries: a
     # free upstream router, a decision endpoint, a preview alias. They are
@@ -652,6 +669,7 @@ def run(args) -> int:
         # Decision models answer a schema, not a chat turn: never tier members.
         "decision_models": decision_models(rows),
         "guests": guest_results,
+        "catalog_sync": catalog_sync,
         "default_model": {"model": default, **default_note},
         "classifier": classifier,
         "quarantine": quarantine,
