@@ -202,6 +202,11 @@ class DeploymentClient:
             return {"healthy_endpoints": [], "unhealthy_endpoints": [
                 {"error": "503 high demand"}
             ]}
+        if state == "budget":
+            return {"error_status": 503, "error_body": {"unhealthy_endpoints": [{
+                "error": "litellm.BadRequestError: Budget has been exceeded! "
+                         "Current cost: 500.009, Max budget: 500.0",
+            }]}}
         return {"error_status": 500}
 
     def post(self, path, body, timeout=None):
@@ -231,6 +236,28 @@ class DeploymentHealthTest(unittest.TestCase):
     def test_non_429_endpoint_error_is_not_flakiness(self):
         client_ = DeploymentClient({"m": ["unhealthy"]})
         self.assertEqual(client.deployment_health(client_, "m"), "unhealthy")
+
+    def test_budget_error_is_its_own_state(self):
+        client_ = DeploymentClient({"m": ["budget"]})
+        self.assertEqual(client.deployment_health(client_, "m"), "budget_exceeded")
+
+
+class BudgetSignalTest(unittest.TestCase):
+    def test_litellm_budget_messages_are_recognised(self):
+        for text in (
+            "Budget has been exceeded! Current cost: 500, Max budget: 500",
+            "ExceededBudget: crossed spend within a budget",
+            "budget_exceeded",
+        ):
+            self.assertTrue(client.budget_exceeded(text), text)
+
+    def test_other_failures_are_not_budget(self):
+        for text in (
+            "insufficient_credits: no available platform credits",
+            "429 rate limit exceeded",
+            "budget model not found",
+        ):
+            self.assertFalse(client.budget_exceeded(text), text)
 
 
 class TriageTest(unittest.TestCase):

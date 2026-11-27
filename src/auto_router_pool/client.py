@@ -54,6 +54,27 @@ class Client:
         return self.request(path, body, "PATCH")
 
 
+BUDGET_WORDS = (
+    "budget has been exceeded",
+    "budget exceeded",
+    "budget_exceeded",
+    "exceededbudget",
+)
+
+
+def budget_exceeded(error) -> bool:
+    """Whether an upstream answer is LiteLLM's budget-exceeded error.
+
+    Budget is enforced per key, so this is the one failure that says every
+    deployment sharing the credential is unusable, not just the one that
+    answered. The check is on the message, never on a credential name.
+    """
+    text = str(error or "").lower()
+    return any(word in text for word in BUDGET_WORDS) or (
+        "budget" in text and "exceed" in text
+    )
+
+
 def deployment_health(client: Client, model_id: str, timeout: float = 25) -> str:
     """One health sample for a single deployment.
 
@@ -88,6 +109,8 @@ def deployment_health(client: Client, model_id: str, timeout: float = 25) -> str
     unhealthy = reported("unhealthy_endpoints")
     if unhealthy:
         error = str(unhealthy[0].get("error", "")).lower()
+        if budget_exceeded(error):
+            return "budget_exceeded"
         if any(
             marker in error
             for marker in ("429", "rate limit", "rate_limit", "usage limit", "cooling down")

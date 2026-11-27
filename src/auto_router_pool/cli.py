@@ -58,6 +58,7 @@ from .pool import (
     free_gaps,
     free_models,
 )
+from .quarantine import budget_sweep
 from .quarantine import sweep as quarantine_sweep
 from .registry import ensure_guests, load_guests, registered
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
@@ -477,8 +478,19 @@ def run(args) -> int:
 
     # Blocks are capacity, so the same probe that chooses a model keeps the flags
     # honest: a group that answers is unblocked, one that cannot is narrowed.
+    budget_quarantine: list[dict] = []
     quarantine: list[dict] = []
     if args.quarantine:
+        # Budget is per key: one budget-exceeded answer blocks every deployment
+        # sharing that credential, even when a sibling key still answers.
+        budget_quarantine = budget_sweep(
+            litellm, rows,
+            lambda model_id: deployment_health(litellm, model_id),
+            apply=args.apply,
+        )
+        if budget_quarantine and args.apply:
+            rows = models(litellm)
+
         managed: set[str] = set()
         for row in rows:
             if row["model_name"] not in ROUTERS:
@@ -723,6 +735,7 @@ def run(args) -> int:
         "default_model": {"model": default, **default_note},
         "classifier": classifier,
         "quarantine": quarantine,
+        "budget_quarantine": budget_quarantine,
         # Every group that could classify if it answered: a decision-only model,
         # or a chat model that also serves /v1/decisions.
         "classifier_candidates": classifier_candidates(rows, catalog),

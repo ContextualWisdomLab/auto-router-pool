@@ -15,6 +15,93 @@ from __future__ import annotations
 from .pool import MIN_INPUT_TOKENS, input_window
 
 MARKER = "auto_pool_quarantined"
+BUDGET_MARKER = "auto_pool_budget_blocked"
+
+
+def budget_sweep(client, rows: list[dict], health, apply: bool = False) -> list[dict]:
+    """Align whole credentials with LiteLLM's budget verdict.
+
+    A budget is enforced per key, so one budget-exceeded deployment proves every
+    deployment sharing that credential is unusable -- including ones a sibling
+    model group would otherwise hide, because a probe of the group may be served
+    by a different key. ``health`` is called with a deployment id; the health
+    route answers for blocked deployments too, so nothing has to be unblocked
+    just to learn the credential's state.
+
+    Only this sweep's own marker is lifted on recovery. A deployment blocked for
+    another reason without the marker is adopted into the budget marker (the
+    proof is direct), so its recovery can be automated as well.
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        credential = (row.get("litellm_params") or {}).get("litellm_credential_name")
+        if credential and (row.get("model_info") or {}).get("id"):
+            groups.setdefault(credential, []).append(row)
+
+    actions: list[dict] = []
+    for credential in sorted(groups):
+        group = groups[credential]
+        canary = min(
+            group,
+            key=lambda row: (
+                str((row.get("model_info") or {}).get("mode") or "chat")
+                not in ("chat", "completion"),
+                bool((row.get("model_info") or {}).get("blocked")),
+                (row.get("litellm_params") or {}).get("order", 1),
+            ),
+        )
+        identifier = canary["model_info"]["id"]
+        state = health(identifier)
+        if state == "budget_exceeded":
+            for row in group:
+                info = row.get("model_info") or {}
+                deployment = info.get("id")
+                was_blocked = bool(info.get("blocked"))
+                # Already blocked by this sweep with its marker: nothing to prove
+                # or write again, so a repeated run stays silent.
+                if was_blocked and info.get(BUDGET_MARKER):
+                    continue
+                if apply:
+                    if not was_blocked:
+                        result = client.post("/model/block", {"model_id": deployment})
+                        if result.get("error_status") is not None:
+                            actions.append({
+                                "model": row["model_name"], "deployment": deployment,
+                                "action": "failed",
+                                "detail": f"block_{result['error_status']}",
+                            })
+                            continue
+                    if not info.get(BUDGET_MARKER):
+                        client.patch(
+                            f"/model/{deployment}/update",
+                            {"model_info": {BUDGET_MARKER: True}},
+                        )
+                info["blocked"] = True
+                info[BUDGET_MARKER] = True
+                actions.append({
+                    "model": row["model_name"], "deployment": deployment,
+                    "action": "adopted" if was_blocked else "blocked",
+                    "reason": "budget_exceeded",
+                })
+        elif state == "ok":
+            for row in group:
+                info = row.get("model_info") or {}
+                if not info.get(BUDGET_MARKER):
+                    continue
+                deployment = info["id"]
+                if apply:
+                    client.post("/model/unblock", {"model_id": deployment})
+                    client.patch(
+                        f"/model/{deployment}/update",
+                        {"model_info": {BUDGET_MARKER: False}},
+                    )
+                info["blocked"] = False
+                info[BUDGET_MARKER] = False
+                actions.append({
+                    "model": row["model_name"], "deployment": deployment,
+                    "action": "unblocked", "reason": "budget_recovered",
+                })
+    return actions
 
 
 def sweep(client, rows: list[dict], names, probe, apply: bool = False) -> list[dict]:

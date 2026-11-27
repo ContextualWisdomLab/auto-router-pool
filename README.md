@@ -104,6 +104,12 @@ unreachable catalogue or a failed discovery is reported in the JSON summary and
 skipped, so one provider never hides the others. None of these modes changes a
 block flag: `--quarantine` owns those.
 
+`--quarantine` also checks one deployment per static credential through
+`/health`. When the answer is LiteLLM's `Budget has been exceeded` error, every
+deployment sharing that credential is blocked and marked
+`auto_pool_budget_blocked`; a later healthy answer lifts only that marker. Budget
+is enforced per key, so a sibling deployment on another key cannot hide it.
+
 ## Effort ladder matters
 
 Scores are per effort, not per model. Measured on the Artificial Analysis
