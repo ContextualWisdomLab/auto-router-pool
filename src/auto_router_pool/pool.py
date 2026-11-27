@@ -4,6 +4,8 @@ from __future__ import annotations
 import hashlib
 import json
 
+from .assign import cost
+
 ROUTING_POLICY_VERSION = 2
 
 
@@ -97,9 +99,9 @@ def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: st
     """Cheapest remaining candidates, so light tiers need no supplied list.
 
     A light tier exists to be cheap and fast, so the small models are the ones
-    the pool already proved usable and that cost least at the light effort.
-    Price comes first and index only breaks a tie, because a pricey "small"
-    model defeats the tier it is placed in.
+    the pool already proved usable and that cost least for an extraction-sized
+    run. Input and output prices enter separately (``assign.cost``): a light
+    tier is mostly prompt, so a low output price alone proves nothing.
     """
     skip = set(taken)
     priced = []
@@ -110,6 +112,6 @@ def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: st
         if not result:
             continue
         index, _, entry = result
-        priced.append((name, (entry["in"] + entry["out"]) / 2, index))
+        priced.append((name, cost(entry, "extract"), index))
     priced.sort(key=lambda item: (item[1], -item[2]))
     return [name for name, _, _ in priced[:limit]]

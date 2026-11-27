@@ -28,19 +28,23 @@ the same model at `max`.
    `--micro` entry.
 3. **Fetch scores** from the Artificial Analysis model page, cached per slug.
 4. **Solve roles** as a linear program over the measured ladders
-   (`assign.roles`): minimise the blended price of the four roles subject to each
-   role reaching a floor taken from the roster itself.
+   (`assign.roles`): minimise the modelled price of the four roles subject to
+   each role reaching a floor taken from the roster itself.
 
    | role | floor (measured index) | effort |
    |---|---|---|
    | `premium` | within 1 point of the best | `xhigh` |
    | `primary` | within 2 points, and not the premium model | `high` |
    | `runner_up` | within 6 points, and neither of the two above | `high` |
-   | `budget` | no floor: best index per blended dollar | `medium` |
+   | `budget` | no floor: best index per modelled dollar | `medium` |
 
    No price is written into the policy. The cheapest model that still clears its
    floor wins, so a price change cannot silently demote a role, and a thin
-   catalogue reuses the previous role instead of failing the run.
+   catalogue reuses the previous role instead of failing the run. Every cost
+   comparison prices **one run from the input and output prices separately**,
+   weighted by the tier's token mix (`assign.PROFILES`): extraction is
+   prompt-heavy and long-horizon reasoning is answer-heavy, so averaging the two
+   prices would rank them the same.
 
    `micro` is not chosen by a floor either: it is the two cheapest candidates the
    run already proved usable, at `low`, so the light tiers need no supplied list.
@@ -97,11 +101,59 @@ support, the score each tier assumes and the (model, effort) entries assigned to
 it. A repeated entry set is merged instead of given a second name, so the plan
 never publishes two tiers that hand out the same score.
 
-Each tier is then padded to four models (`assign.grow`): a candidate joins only
-when one of its rungs reaches the tier's weakest entry inside the same band, and
-only while it keeps the tier's declared input window intact. Fallbacks therefore
-add redundancy without lowering the tier's score or shrinking the context the
-router advertises.
+### What the tiers divide
+
+The `auto` tiers partition the *task*, not a model class: text (extraction,
+conversation, review, long-horizon reasoning), code by scope (one change versus
+system design), and media by **output** modality — an image or video generator
+cannot answer a text request at all.
+
+| tier | what the request must produce |
+|---|---|
+| `명시 정보 추출·단순 분류·고정 규칙 처리` | short, checkable output from explicit rules |
+| `대화·요약·번역·창작 텍스트` | text-only answer; the catch-all tier |
+| `코드·데이터·도구 사용` | one change, one query, one known procedure |
+| `복잡한 코딩·시스템 설계·기업 지식 업무` | several systems, trade-offs, design or root cause |
+| `최고난도 추론·심층 연구·복잡한 장기 작업` | no known path, long verification, competing hypotheses |
+| `이미지·화면 해석·화면 조작` | image or screen *input*, text answer |
+| `이미지 생성·편집` | image *output* |
+| `비디오 생성·편집` | video *output* |
+
+Precedence is fixed so nearly every request lands in exactly one tier: output
+modality, then media input with a text answer, then code/tools, then text shape,
+with `대화·요약·번역·창작 텍스트` as the catch-all. A tier with no model is dropped
+instead of published empty, which is the failure mode that makes classification
+fall through; the catch-all is also the `fallback_tier`, so a classifier that
+errors still lands somewhere that can answer. Definitions, examples and the
+classifier prompt are published in the same patch as the tiers, because the
+engine rejects a tier map that does not cover every definition.
+
+Only one router may carry operator-defined tiers or an operator-written
+classifier prompt, and that budget belongs to `auto`. `auto-strix` (security:
+static analysis, exploit reproduction, threat modelling, incident response) and
+`auto-advisor` (model behaviour monitoring: drift, regression triage, root cause,
+guardrail review) therefore keep the shipped `SIMPLE`/`MEDIUM`/`COMPLEX`/`REASONING`
+tiers and differ in which models they hand each tier: security keeps a
+code-literate model on every tier, while monitoring starts on the budget model
+and escalates only when a case gets hard.
+
+Every router classifies each request (`classification_mode: every_request`) with
+`session_affinity` off, so the tier is chosen per request — including the
+tool-result continuations of one turn, which is what lets a turn that turns out
+harder escalate mid-loop. `user_turn` is the opposite choice: it replays the
+turn's first decision and never sees the later tool calls.
+
+Media tiers are filled from LiteLLM's registration metadata (`model_info.mode`),
+never from a model name, and their entries carry no `reasoning_effort`. A text
+chain never falls back to a generator and a media tier never falls back to a chat
+model; non-chat deployments are also ignored when capping the advertised window,
+because they never receive the routed chat request.
+
+Each tier is then padded with every same-score model (`assign.grow`): a candidate joins only
+when one of its rungs reaches the tier's weakest entry inside the same band, fits
+the tier's modality, and keeps the tier's declared input window intact. Width is
+never a configured number: the roster decides how many interchangeable fallbacks
+a tier gets.
 
 ## Flaky deployments
 

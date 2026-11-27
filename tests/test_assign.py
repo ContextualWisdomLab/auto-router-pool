@@ -85,8 +85,8 @@ class FrontierTest(unittest.TestCase):
                 self.assertLessEqual(len(entries), 4, tier)
                 names = [model for model, _ in entries]
                 self.assertEqual(len(names), len(set(names)), tier)
-        visual = routers["auto"]["시각 자료 해석·화면 조작·글쓰기"]
-        self.assertEqual(len(visual), 3)
+        vision = routers["auto"][tiers.T_VISION]
+        self.assertEqual(len(vision), 3)
 
     def test_frontier_keeps_peak_efforts_without_ladders(self):
         routers = tiers.routers("sol", "astra", "budget", "old", (), {"astra": "max"})
@@ -140,6 +140,26 @@ class RolesTest(unittest.TestCase):
 
     def test_empty_roster_assigns_nothing(self):
         self.assertEqual(set(assign.roles({}).values()), {None})
+
+
+class CostTest(unittest.TestCase):
+    def test_input_and_output_prices_are_priced_separately(self):
+        # Cheap prompt with a dear answer versus the reverse, same index.
+        chatty = {"index": 50.0, "in": 0.1, "out": 30.0}
+        bulk = {"index": 50.0, "in": 5.0, "out": 0.1}
+        # A prompt-heavy run prefers the cheap prompt, an answer-heavy run the
+        # cheap answer: one blended number could only pick one of them.
+        self.assertLess(assign.cost(chatty, "extract"), assign.cost(bulk, "extract"))
+        self.assertLess(assign.cost(bulk, "deep"), assign.cost(chatty, "deep"))
+
+    def test_profile_decides_the_cheapest_rung(self):
+        # Same two rungs, opposite winners depending on the token mix.
+        rungs = assign._rungs({
+            "max": {"index": 60.0, "in": 0.1, "out": 40.0},
+            "high": {"index": 58.0, "in": 6.0, "out": 0.2},
+        })
+        self.assertEqual(assign._cheapest(rungs, 58.0, 3.0, "extract")["effort"], "max")
+        self.assertEqual(assign._cheapest(rungs, 58.0, 3.0, "deep")["effort"], "high")
 
 
 class GrowTest(unittest.TestCase):
