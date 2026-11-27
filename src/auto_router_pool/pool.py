@@ -131,6 +131,39 @@ def free_models(rows: list[dict]) -> set[str]:
     return free
 
 
+# A decision model answers a schema of typed questions in one forward pass and
+# returns calibrated probabilities. It is not a chat or streaming model, so it
+# can never fill a routing tier however cheap it is.
+DECISION_MODES = {"decision", "evaluation"}
+DECISION_ENDPOINTS = ("/v1/decisions", "/decisions", "/v1/systemone", "/systemone")
+DECISION_WORDS = ("decision model",)
+
+
+def is_decision(row: dict) -> bool:
+    """The registration says this model decides rather than chats."""
+    info = row.get("model_info") or {}
+    if str(info.get("mode") or "").lower() in DECISION_MODES:
+        return True
+    endpoints = " ".join(str(e).lower() for e in (info.get("supported_endpoints") or []))
+    if any(marker in endpoints for marker in DECISION_ENDPOINTS):
+        return True
+    text = f"{info.get('description') or ''} {info.get('availability') or ''}".lower()
+    return any(word in text for word in DECISION_WORDS)
+
+
+def decision_models(rows: list[dict]) -> list[str]:
+    """Groups that are decision models, reported instead of looking broken.
+
+    They are legitimate to register and cheap to run, but a chat tier can never
+    use one: the request shape is a decision schema, not a conversation. Naming
+    them keeps them out of the "blocked model" bucket and out of every tier.
+    """
+    return sorted(
+        name for name in {row["model_name"] for row in rows}
+        if any(is_decision(row) for row in rows if row["model_name"] == name)
+    )
+
+
 def free_gaps(rows: list[dict], scored) -> list[dict]:
     """Free groups the router cannot use yet, each with the reason.
 

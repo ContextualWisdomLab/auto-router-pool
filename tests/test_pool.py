@@ -168,6 +168,34 @@ class FreeModelsTest(unittest.TestCase):
         )
 
 
+class DecisionModelTest(unittest.TestCase):
+    def row(self, name, info):
+        return {"model_name": name, "model_info": info}
+
+    def test_a_decision_mode_is_recognised(self):
+        rows = [self.row("dec", {"mode": "decision"}), self.row("chatty", {"mode": "chat"})]
+        self.assertEqual(pool.decision_models(rows), ["dec"])
+
+    def test_an_evaluation_mode_is_recognised(self):
+        # The price catalogue files the jev variants under 'evaluation'.
+        self.assertEqual(pool.decision_models([self.row("judge", {"mode": "evaluation"})]),
+                         ["judge"])
+
+    def test_a_decision_endpoint_is_recognised(self):
+        rows = [self.row("clef", {"mode": "chat",
+                                   "supported_endpoints": ["/v1/systemone"]})]
+        self.assertEqual(pool.decision_models(rows), ["clef"])
+
+    def test_a_described_decision_model_is_recognised(self):
+        rows = [self.row("clef-flash", {"mode": "chat",
+                                         "description": "a 9B decision model, not chat"})]
+        self.assertEqual(pool.decision_models(rows), ["clef-flash"])
+
+    def test_a_plain_chat_model_is_not_a_decision_model(self):
+        rows = [self.row("gpt", {"mode": "chat", "description": "general chat model"})]
+        self.assertEqual(pool.decision_models(rows), [])
+
+
 class FreeGapsTest(unittest.TestCase):
     def row(self, name, upstream, blocked=False, window=400000, info=None):
         return {

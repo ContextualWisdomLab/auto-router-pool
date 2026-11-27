@@ -40,6 +40,7 @@ from .pool import (
     pick_micro,
     score_hashes,
     stable_deployments,
+    decision_models,
     free_gaps,
     free_models,
 )
@@ -509,6 +510,8 @@ def run(args) -> int:
         # Free groups the pool cannot route yet, so a registered-but-blocked or
         # still-unmeasured free model is visible instead of silently absent.
         "free_gaps": free_gaps(rows, candidates),
+        # Decision models answer a schema, not a chat turn: never tier members.
+        "decision_models": decision_models(rows),
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,

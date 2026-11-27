@@ -165,6 +165,14 @@ Cost fields cannot decide this in either direction, so they are not consulted: a
 registration that was never priced declares zero, and a free tier may still carry
 a price.
 
+A **decision model** is a different kind of endpoint, not a cheaper chat model: it
+takes a state plus a schema of typed questions and returns calibrated
+probabilities in one forward pass, so it can never fill a routing tier. Such a
+group is recognised from registration metadata — a `mode` of `decision` or
+`evaluation`, a `/v1/decisions` or `/v1/systemone` endpoint, or a description that
+says so — and is listed separately in the run summary rather than counted as a
+broken chat candidate.
+
 ## Flaky deployments
 
 A model can be registered more than once (one deployment per credential or
