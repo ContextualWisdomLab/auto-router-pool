@@ -118,24 +118,41 @@ def route(entry: dict) -> dict | None:
     return routes[0] if routes else None
 
 
-def is_decisions_model(entry: dict) -> bool:
-    """Whether the catalogue describes a native decision model.
+def decisions_endpoint(entry: dict) -> str | None:
+    """Which decision API the catalogue says this model speaks, if any.
 
-    A decision model answers ``state`` + ``questions`` on ``/v1/systemone``;
-    registering it through the OpenAI chat transport would make the proxy call
-    ``/v1/decisions``, which the provider refuses with an explanation instead of
-    an answer.
+    Two shapes exist. A native model takes ``state`` + ``questions`` on
+    ``/v1/systemone``; an OpenAI-shaped model takes ``input`` + ``questions`` on
+    ``/v1/decisions``. They need different transports, and a model that also
+    serves chat is capable of deciding but is not decision-only.
+    """
+    model = entry.get("model") or {}
+    endpoints = [str(item).lower() for item in (model.get("supported_endpoints") or [])]
+    text = " ".join(
+        str(model.get(field) or "") for field in ("description", "display_name", "availability")
+    ).lower()
+    if any("systemone" in item for item in endpoints) or "systemone" in text:
+        return "/v1/systemone"
+    decisions = any("/decisions" in item for item in endpoints)
+    chat = any("chat/completions" in item for item in endpoints)
+    if decisions and not chat:
+        return "/v1/decisions"
+    if "not a chat" in text and ("decision" in text or "/v1/decisions" in text):
+        return "/v1/decisions"
+    return None
+
+
+def is_decisions_model(entry: dict) -> bool:
+    """Whether the catalogue describes a decision-only model.
+
+    The endpoint matters for the transport: registering a native model through
+    the OpenAI chat transport would send ``/v1/decisions`` and be refused, while
+    an OpenAI-shaped decision model must keep that route.
     """
     model = entry.get("model") or {}
     if str(model.get("mode") or "").lower() in {"decision", "decisions", "evaluation"}:
         return True
-    endpoints = " ".join(str(item) for item in (model.get("supported_endpoints") or []))
-    if "/v1/systemone" in endpoints and "chat/completions" not in endpoints:
-        return True
-    text = " ".join(
-        str(model.get(field) or "") for field in ("description", "display_name", "availability")
-    ).lower()
-    return any(word in text for word in DECISION_WORDS)
+    return decisions_endpoint(entry) is not None
 
 
 def prompt_cache_drop(params: dict) -> dict:
@@ -247,19 +264,25 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
             order = previous.get("litellm_params", {}).get("order", 1)
 
         publisher, transport = resolve_publisher(slug, model, provider_route, prices)
-        decisions = is_decisions_model(entry)
-        if decisions:
+        endpoint = decisions_endpoint(entry)
+        if endpoint == "/v1/systemone":
             params = {
                 "model": "hosted_vllm/" + slug,
                 "custom_llm_provider": "hosted_vllm",
             }
-            endpoints = ["/v1/systemone"]
+        elif endpoint == "/v1/decisions":
+            # OpenAI's decisions shape is served by the OpenAI transport; only
+            # the native SystemOne shape needs the generic transport.
+            params = {
+                "model": "openai/" + slug,
+                "custom_llm_provider": "openai",
+            }
         else:
             params = {
                 "model": transport + "/" + slug,
                 "custom_llm_provider": transport,
             }
-            endpoints = None
+        endpoints = [endpoint] if endpoint else None
         params.update({
             "api_base": API if transport == "anthropic" else API + "/v1",
             "litellm_credential_name": CREDENTIAL,
@@ -273,7 +296,7 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
         params = prompt_cache_drop(params)
 
         info = {
-            "mode": "decisions" if decisions else "chat",
+            "mode": "decisions" if endpoint else "chat",
             OWNER: OWNER,
             "catalog_slug": slug,
             "original_maker": publisher,

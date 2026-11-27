@@ -72,6 +72,27 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(body["litellm_params"]["model"], "anthropic/claude-sonnet-5")
         self.assertEqual(body["litellm_params"]["api_base"], catalog.API)
 
+    def test_an_openai_decisions_model_keeps_the_openai_transport(self):
+        luna = entry(
+            "gpt-6-luna-decisions", maker="OpenAI",
+            description=(
+                "GPT-6 Luna on the OpenAI Decisions API; served through POST "
+                "/v1/decisions in OpenAI's request shape; not a chat or streaming model."
+            ),
+        )
+        _, body = by_name(catalog.plan({"gpt-6-luna-decisions"}, {"gpt-6-luna-decisions": luna}, []), "gpt-6-luna-decisions")
+        self.assertEqual(body["litellm_params"]["model"], "openai/gpt-6-luna-decisions")
+        self.assertEqual(body["litellm_params"]["custom_llm_provider"], "openai")
+        self.assertEqual(body["model_info"]["mode"], "decisions")
+        self.assertEqual(body["model_info"]["supported_endpoints"], ["/v1/decisions"])
+
+    def test_a_chat_model_that_also_serves_decisions_stays_chat(self):
+        luna = entry("gpt-6-luna", maker="OpenAI", description="general chat model",
+                     supported_endpoints=["/v1/chat/completions", "/v1/decisions"])
+        _, body = by_name(catalog.plan({"gpt-6-luna"}, {"gpt-6-luna": luna}, []), "gpt-6-luna")
+        self.assertEqual(body["model_info"]["mode"], "chat")
+        self.assertNotIn("supported_endpoints", body["model_info"])
+
     def test_a_decision_model_uses_the_native_systemone_transport(self):
         clef = entry(
             "clef", maker="Cloudflare", routes=(("experiential_cloud", True),),
