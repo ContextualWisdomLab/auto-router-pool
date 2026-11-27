@@ -35,6 +35,9 @@ the same model at `max`.
    | `primary` | within 2 points of the best at `high`, prefer models without the `-astra` suffix, then lowest price | $3 / $12 |
    | `budget` | best index per blended dollar at `medium` | $0.30 / $1.50 |
 
+   `micro` is not chosen by a cap: it is the two cheapest candidates the run
+   already proved usable, at `low`, so the light tiers need no supplied list.
+
    The complexity classifier is pinned to the `runner_up` model with a 30s
    timeout. It runs on every routed request, so it must be a model the router
    already selects and one with headroom: a stale classifier times out, and the
@@ -61,11 +64,31 @@ Intelligence Index (2026-11), three variants of the same roster:
 | budget | 27.9 | 23.5 | 21.4 | 18.5 | 9.7 |
 
 The budget variant at `low` scores a third of what it does at `max`, so the light
-tiers run it at `medium`/`high`. The frontier tier runs every entry at its own
-measured peak, so its effort labels can differ: the primary variant gains under
-a point from `xhigh` over `high`, while the budget variant peaks at `max`
-(27.9 vs 23.5). Peak effort maximizes each model; it does not equalize them,
-and a cheaper fallback still scores lower than the frontier model.
+tiers run it at `medium`/`high`.
+
+A tier's entries are fallbacks for the same request, so the frontier tier is
+placed for **equal score** instead of at each model's own peak. The placement is
+a small integer program (`assign.place`): maximise the chain's assumed score `T`
+subject to one rung per model, every entry at or above `T`, and every entry
+inside a `band` of it; then take the cheapest rung per model, preferring the
+lower rung on a price tie. `T` is the weakest ceiling in the chain, because
+nothing above it can be assumed equal.
+
+On the roster above the three peaks are 62.2 / 57.3 / 54.7, so a fallback cost
+up to 7.5 index points. Placed together they land at 57.1 / 54.8 / 54.7 (spread
+2.4): the router now hands out one score whichever entry answers, and the
+strongest model runs two rungs cheaper than its peak.
+
+### How many tiers
+
+The tier *count* falls out of the same measurement (`assign.schedule`). A tier
+can only assume a score its own members reach, and members must stay inside the
+band of each other, so covering the roster's achievable range with the fewest
+tiers is an interval-cover problem, which the greedy sweep solves exactly. Every
+run reports the result as `tier_plan`: the number of tiers the measured ladders
+support, the score each tier assumes and the (model, effort) entries assigned to
+it. A repeated entry set is merged instead of given a second name, so the plan
+never publishes two tiers that hand out the same score.
 
 ## Flaky deployments
 
@@ -155,6 +178,8 @@ Requires Python 3.10+. No third-party runtime dependencies.
 
 Flags: `--apply`, `--watch`, `--refresh-scores`, `--smoke`, `--prefix`,
 `--suffixes`, `--micro`, `--catalogue-proxy`, `--home`, `--env-file`.
+`--micro` stays as an override, but no list is required: the light tiers are
+filled from the cheapest candidates the run already proved usable.
 
 Candidate ids come from LiteLLM's `/model/info`, which is the routing truth: a
 model the proxy lists but LiteLLM does not register cannot serve a request. The
@@ -163,8 +188,9 @@ catalogue proxy is an explicit opt-in for setups where its `/v1/models` is
 authoritative; the run report names the source in `catalogue` (`litellm` or
 `cliproxy`).
 
-Nothing about a particular deployment is hardcoded: model families, the small
-models used for light tiers, and every path are supplied by the caller. The
+Nothing about a particular deployment is hardcoded: model families, the
+light-tier roster (derived from the pool's own cheapest usable candidates) and
+every path come from the catalogue or the caller. The
 repository contains no keys, no host addresses beyond the upstream defaults, and
 no runtime state.
 

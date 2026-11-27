@@ -153,5 +153,33 @@ class ContextFloorTest(unittest.TestCase):
         )
 
 
+class PickMicroTest(unittest.TestCase):
+    def test_taken_roles_are_excluded(self):
+        candidates = {
+            "primary": {"max": {"index": 50.0, "in": 1, "out": 2}},
+            "cheap": {"max": {"index": 20.0, "in": 0.1, "out": 0.2}},
+        }
+        self.assertEqual(pool.pick_micro(candidates, ["primary"]), ["cheap"])
+
+    def test_cheapest_two_win(self):
+        candidates = {
+            "cheap": {"max": {"index": 20.0, "in": 0.10, "out": 0.20}},
+            "cheaper": {"max": {"index": 15.0, "in": 0.05, "out": 0.10}},
+            "dear": {"max": {"index": 60.0, "in": 5.0, "out": 20.0}},
+            "free": {"max": {"index": 25.0, "in": 0, "out": 0}},
+        }
+        self.assertEqual(pool.pick_micro(candidates, ["dear"]), ["cheaper", "cheap"])
+
+    def test_price_tie_prefers_higher_index(self):
+        candidates = {
+            "low": {"max": {"index": 10.0, "in": 1, "out": 1}},
+            "high": {"max": {"index": 30.0, "in": 1, "out": 1}},
+        }
+        self.assertEqual(pool.pick_micro(candidates), ["high", "low"])
+
+    def test_models_without_a_priced_rung_are_skipped(self):
+        self.assertEqual(pool.pick_micro({"ghost": {}, "empty": {"low": {}}}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

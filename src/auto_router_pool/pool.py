@@ -137,3 +137,25 @@ def pick(
 
 def pick_primary(candidates: dict[str, dict]):
     return pick(candidates, "high", 3, 12, deprioritize_suffix="-astra")
+
+
+def pick_micro(candidates: dict[str, dict], taken=(), limit: int = 2, effort: str = "low"):
+    """Cheapest remaining candidates, so light tiers need no supplied list.
+
+    A light tier exists to be cheap and fast, so the small models are the ones
+    the pool already proved usable and that cost least at the light effort.
+    Price comes first and index only breaks a tie, because a pricey "small"
+    model defeats the tier it is placed in.
+    """
+    skip = set(taken)
+    priced = []
+    for name, variants in candidates.items():
+        if name in skip:
+            continue
+        result = score(variants, effort)
+        if not result:
+            continue
+        index, _, entry = result
+        priced.append((name, (entry["in"] + entry["out"]) / 2, index))
+    priced.sort(key=lambda item: (item[1], -item[2]))
+    return [name for name, _, _ in priced[:limit]]

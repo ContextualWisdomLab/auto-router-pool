@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import aa
+from .assign import SPREAD, place, schedule
 from .apply import apply as apply_changes
 from .apply import (
     backup,
@@ -36,6 +37,7 @@ from .pool import (
     flaky_deployments,
     group_state,
     pick,
+    pick_micro,
     pick_primary,
     score,
     score_hashes,
@@ -424,16 +426,32 @@ def run(args) -> int:
         print(json.dumps({"error": "no runner-up candidate", "status": status}))
         return 1
 
-    # A micro model that cannot serve this run is dropped from the light tiers
-    # instead of being written back because its declared window is large enough.
-    micro, micro_status = usable_micro(
-        litellm, rows, candidates, settings.micro, probe_failures=probe_failures
-    )
-    status.update(micro_status)
+    # Light tiers need small models; by default they come from the pool itself,
+    # so nothing has to be named on the command line. ``--micro`` stays as an
+    # explicit override, and a model that cannot serve this run is dropped from
+    # the light tiers instead of being written back because its declared window
+    # is large enough.
+    if settings.micro:
+        micro, micro_status = usable_micro(
+            litellm, rows, candidates, settings.micro, probe_failures=probe_failures
+        )
+        status.update(micro_status)
+    else:
+        micro = pick_micro(
+            candidates, [premium[0], primary[0], budget[0], runner_up]
+        )
     top = {name: top_effort(variants) for name, variants in candidates.items()}
+    frontier = place([premium[0], primary[0], runner_up], candidates)
+    # Fewest score-equal tiers that cover every measured level of this roster.
+    tier_plan = schedule(
+        [premium[0], primary[0], budget[0], runner_up], candidates
+    )
     changes = plan(
         rows,
-        routers(primary[0], premium[0], budget[0], runner_up, micro, top),
+        routers(
+            primary[0], premium[0], budget[0], runner_up, micro, top,
+            ladders=candidates,
+        ),
         primary[0],
         runner_up,
     )
@@ -449,6 +467,25 @@ def run(args) -> int:
             "premium": round(premium[2], 1),
             "primary": round(primary[2], 1),
             "budget": round(budget[2], 1),
+        },
+        "frontier": {
+            "target": None if frontier["target"] is None else round(frontier["target"], 2),
+            "spread": round(frontier["spread"], 2),
+            "efforts": {model: effort for model, effort, _ in frontier["entries"]},
+        },
+        "tier_plan": {
+            "tiers": len(tier_plan),
+            "band": SPREAD,
+            "assignments": [
+                {
+                    "score": round(tier["target"], 2),
+                    "until": round(tier["covered"], 2),
+                    "entries": {
+                        model: effort for model, effort, _ in tier["entries"]
+                    },
+                }
+                for tier in tier_plan
+            ],
         },
         "score_updates": updates,
         "quarantined": sorted(set(quarantined)),
