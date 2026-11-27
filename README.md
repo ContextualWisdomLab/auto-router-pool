@@ -165,6 +165,27 @@ Cost fields cannot decide this in either direction, so they are not consulted: a
 registration that was never priced declares zero, and a free tier may still carry
 a price.
 
+### Guest models
+
+Some deployments are never discovered by a catalogue sync: a free upstream
+router, a decision endpoint, a preview alias. They are declared in
+`auto-pool-guests.json` under the pool home and registered by `--register`
+(which previews unless `--apply` is also given):
+
+```json
+{"models": [{"model_name": "jev",
+             "litellm_params": {"model": "openrouter/typesafe/jev-router",
+                                "api_base": "https://openrouter.ai/api/v1",
+                                "litellm_credential_name": "OpenRouter"},
+             "model_info": {"mode": "chat", "max_input_tokens": 1000000,
+                            "is_free": true}}]}
+```
+
+A guest registers once and is then left alone. One that registers but cannot
+answer a one-token probe is deleted again, so a stale declaration never leaves a
+dead model group behind; a decision-class guest skips the chat probe because it
+answers a schema instead of a conversation.
+
 A **decision model** is a different kind of endpoint, not a cheaper chat model: it
 takes a state plus a schema of typed questions and returns calibrated
 probabilities in one forward pass, so it can never fill a routing tier. Such a

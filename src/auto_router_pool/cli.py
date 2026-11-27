@@ -44,6 +44,7 @@ from .pool import (
     free_gaps,
     free_models,
 )
+from .registry import ensure_guests, load_guests, registered
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
 
 
@@ -287,6 +288,14 @@ def parse_args(argv=None):
     parser.add_argument("--watch", action="store_true", help="skip refresh when catalogue and policy match")
     parser.add_argument("--refresh-scores", action="store_true", help="re-read every AA page")
     parser.add_argument("--smoke", action="store_true", help="one tiny auto completion after applying")
+    parser.add_argument(
+        "--register", action="store_true",
+        help="register declared guest models that the catalogue does not carry",
+    )
+    parser.add_argument(
+        "--guests", type=Path, default=None,
+        help="guest declarations (default: <home>/auto-pool-guests.json)",
+    )
     parser.add_argument("--env-file", type=Path, default=None, help="file with KEY=VALUE secrets")
     parser.add_argument("--home", type=Path, default=None, help="state, cache and backup directory")
     parser.add_argument("--prefix", default="", help="only models whose id starts with this")
@@ -322,6 +331,28 @@ def run(args) -> int:
 
     litellm = Client(settings.litellm_base, settings.key)
     rows = models(litellm)
+
+    # Guests are models the operator can use that no catalogue sync carries: a
+    # free upstream router, a decision endpoint, a preview alias. They are
+    # declared in a file and registered here, because a model the router does
+    # not know about cannot be routed to at all.
+    guests = load_guests(args.guests or (settings.home / "auto-pool-guests.json"))
+    guest_results: list[dict] = []
+    if guests and args.register:
+        if args.apply:
+            guest_results = ensure_guests(litellm, guests, rows)
+            rows = models(litellm)  # the new groups are routable from here on
+        else:
+            guest_results = [
+                {
+                    "model": guest["model_name"],
+                    "action": (
+                        "present" if registered(rows, guest["model_name"])
+                        else "would_register"
+                    ),
+                }
+                for guest in guests
+            ]
 
     # LiteLLM's registrations are the routing truth: a model the proxy lists but
     # LiteLLM does not register can never serve a request. The proxy stays an
@@ -512,6 +543,7 @@ def run(args) -> int:
         "free_gaps": free_gaps(rows, candidates),
         # Decision models answer a schema, not a chat turn: never tier members.
         "decision_models": decision_models(rows),
+        "guests": guest_results,
         "tier_plan": {
             "tiers": len(tier_plan),
             "band": SPREAD,
