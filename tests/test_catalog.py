@@ -93,6 +93,19 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(body["model_info"]["mode"], "chat")
         self.assertNotIn("supported_endpoints", body["model_info"])
 
+    def test_a_described_decision_only_model_uses_the_openai_route(self):
+        gemini = entry(
+            "gemini-decision-1", maker="Google",
+            description=(
+                "A decision-only multimodal model; called on POST /v1/decisions; "
+                "zero output tokens."
+            ),
+        )
+        _, body = by_name(catalog.plan({"gemini-decision-1"}, {"gemini-decision-1": gemini}, []), "gemini-decision-1")
+        self.assertEqual(body["litellm_params"]["model"], "openai/gemini-decision-1")
+        self.assertEqual(body["model_info"]["mode"], "decisions")
+        self.assertEqual(body["model_info"]["supported_endpoints"], ["/v1/decisions"])
+
     def test_a_decision_model_uses_the_native_systemone_transport(self):
         clef = entry(
             "clef", maker="Cloudflare", routes=(("experiential_cloud", True),),
@@ -115,6 +128,24 @@ class PlanTest(unittest.TestCase):
                          "providers": [{"provider": "x", "routable": False}]},
         }
         self.assertEqual(catalog.plan({"inactive", "images", "no-route"}, public, []), [])
+
+    def test_a_free_variant_is_registered_from_its_base_entry(self):
+        luna = entry(
+            "gpt-6-luna-decisions", maker="OpenAI",
+            description="served through POST /v1/decisions; not a chat or streaming model",
+        )
+        planned = catalog.plan(
+            {"gpt-6-luna-decisions:free"}, {"gpt-6-luna-decisions": luna}, []
+        )
+        action, body = by_name(planned, "gpt-6-luna-decisions:free")
+        self.assertEqual(action, "create")
+        self.assertEqual(body["litellm_params"]["model"], "openai/gpt-6-luna-decisions:free")
+        self.assertEqual(body["model_info"]["mode"], "decisions")
+        self.assertTrue(body["model_info"]["is_free"])
+        self.assertEqual(body["litellm_params"]["input_cost_per_token"], 0.0)
+
+    def test_an_authenticated_model_without_public_metadata_is_still_skipped(self):
+        self.assertEqual(catalog.plan({"ghost"}, {}, []), [])
 
     def test_a_retired_name_is_not_registered(self):
         self.assertEqual(

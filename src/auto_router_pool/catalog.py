@@ -137,7 +137,10 @@ def decisions_endpoint(entry: dict) -> str | None:
     chat = any("chat/completions" in item for item in endpoints)
     if decisions and not chat:
         return "/v1/decisions"
-    if "not a chat" in text and ("decision" in text or "/v1/decisions" in text):
+    # A vendor may state exclusivity in prose instead of an endpoint list.
+    if "/decisions" in text and any(
+        marker in text for marker in ("decision-only", "not a chat")
+    ):
         return "/v1/decisions"
     return None
 
@@ -226,10 +229,18 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
     retired = set(retired)
     planned: list[tuple[str, dict]] = []
     creates = 0
-    for slug in sorted(public):
-        if slug not in auth_ids or slug in retired:
+    for slug in sorted(auth_ids):
+        if slug in retired:
             continue
-        entry = public[slug] or {}
+        entry = public.get(slug)
+        # A free tier is the same model as its base and is often omitted from
+        # the public catalogue. The authenticated list proves it can be called,
+        # and the base entry supplies the metadata, so only derive that case.
+        free = slug.endswith(":free")
+        if entry is None:
+            if not free or slug.removesuffix(":free") not in public:
+                continue
+            entry = public[slug.removesuffix(":free")]
         model = entry.get("model") or {}
         provider_route = route(entry)
         if not provider_route:
@@ -290,13 +301,17 @@ def plan(auth_ids, public: dict, rows: list[dict], prices: dict | None = None,
         })
         in_nano = provider_route.get("input_nano_usd_per_million")
         out_nano = provider_route.get("output_nano_usd_per_million")
-        if isinstance(in_nano, int) and isinstance(out_nano, int):
+        if free:
+            params["input_cost_per_token"] = 0.0
+            params["output_cost_per_token"] = 0.0
+        elif isinstance(in_nano, int) and isinstance(out_nano, int):
             params["input_cost_per_token"] = in_nano / 1e15
             params["output_cost_per_token"] = out_nano / 1e15
         params = prompt_cache_drop(params)
 
         info = {
             "mode": "decisions" if endpoint else "chat",
+            **(({"is_free": True}) if free else {}),
             OWNER: OWNER,
             "catalog_slug": slug,
             "original_maker": publisher,
