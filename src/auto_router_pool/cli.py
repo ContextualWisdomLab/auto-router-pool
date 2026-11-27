@@ -55,6 +55,7 @@ from .pool import (
     free_gaps,
     free_models,
 )
+from .quarantine import sweep as quarantine_sweep
 from .registry import ensure_guests, load_guests, registered
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
 
@@ -312,6 +313,10 @@ def parse_args(argv=None):
         help="keep every fallback chain ending on a live model (own run, no tier write)",
     )
     parser.add_argument(
+        "--quarantine", action="store_true",
+        help="probe the routers' models and align their block flags with the answer",
+    )
+    parser.add_argument(
         "--prices", type=Path, default=None,
         help="pinned LiteLLM price map for --live-fallbacks",
     )
@@ -402,6 +407,37 @@ def run(args) -> int:
                 }
                 for guest in guests
             ]
+
+    # Blocks are capacity, so the same probe that chooses a model keeps the flags
+    # honest: a group that answers is unblocked, one that cannot is narrowed.
+    quarantine: list[dict] = []
+    if args.quarantine:
+        managed: set[str] = set()
+        for row in rows:
+            if row["model_name"] not in ROUTERS:
+                continue
+            config = (row.get("litellm_params") or {}).get(
+                "complexity_router_config"
+            ) or {}
+            for entries in (config.get("tiers") or {}).values():
+                managed.update(entries)
+        # Only chat solvers: a media tier is judged by its own modality, and a
+        # decision model is handled by the classifier probe, not a chat probe.
+        managed = {
+            name for name in managed
+            if any(
+                row["model_name"] == name
+                and str((row.get("model_info") or {}).get("mode") or "chat")
+                in ("chat", "completion")
+                for row in rows
+            )
+        }
+        quarantine = quarantine_sweep(
+            litellm, rows, managed,
+            lambda name: probe(litellm, name), apply=args.apply,
+        )
+        if quarantine and args.apply:
+            rows = models(litellm)
 
     # LiteLLM's registrations are the routing truth: a model the proxy lists but
     # LiteLLM does not register can never serve a request. The proxy stays an
@@ -618,6 +654,7 @@ def run(args) -> int:
         "guests": guest_results,
         "default_model": {"model": default, **default_note},
         "classifier": classifier,
+        "quarantine": quarantine,
         # Every group that could classify if it answered: a decision-only model,
         # or a chat model that also serves /v1/decisions.
         "classifier_candidates": classifier_candidates(rows, catalog),
