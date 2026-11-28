@@ -75,13 +75,10 @@ def budget_exceeded(error) -> bool:
     )
 
 
-def deployment_health(client: Client, model_id: str, timeout: float = 25) -> str:
-    """One health sample for a single deployment.
-
-    ``ok`` means the endpoint answered; ``rate_limited`` means it was a 429 or
-    reported as cooling down. The health route may return 429 with an endpoint
-    report in the error body, so the body is read before the HTTP status.
-    """
+def deployment_health_detail(
+    client: Client, model_id: str, timeout: float = 25
+) -> tuple[str, str]:
+    """One health sample plus the lower-cased upstream error snippet, if any."""
     result = client.get(
         "/health?" + urllib.parse.urlencode({"model_id": model_id}), timeout=timeout
     )
@@ -105,21 +102,31 @@ def deployment_health(client: Client, model_id: str, timeout: float = 25) -> str
         return endpoints
 
     if reported("healthy_endpoints"):
-        return "ok"
+        return "ok", ""
     unhealthy = reported("unhealthy_endpoints")
     if unhealthy:
         error = str(unhealthy[0].get("error", "")).lower()
         if budget_exceeded(error):
-            return "budget_exceeded"
+            return "budget_exceeded", error
         if any(
             marker in error
             for marker in ("429", "rate limit", "rate_limit", "usage limit", "cooling down")
         ):
-            return "rate_limited"
-        return "unhealthy"
+            return "rate_limited", error
+        return "unhealthy", error
     if result.get("error_status") == 429:
-        return "rate_limited"
-    return "unknown"
+        return "rate_limited", ""
+    return "unknown", ""
+
+
+def deployment_health(client: Client, model_id: str, timeout: float = 25) -> str:
+    """One health sample for a single deployment.
+
+    ``ok`` means the endpoint answered; ``rate_limited`` means it was a 429 or
+    reported as cooling down. The health route may return 429 with an endpoint
+    report in the error body, so the body is read before the HTTP status.
+    """
+    return deployment_health_detail(client, model_id, timeout=timeout)[0]
 
 
 DECISION_PATHS = ("/v1/decisions", "/v1/systemone")

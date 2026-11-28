@@ -504,3 +504,88 @@ class CliproxyRecoverySweepTest(unittest.TestCase):
             self.assertEqual(probed_3, ["cp-nf"])
             self.assertEqual([a["deployment"] for a in actions_3], ["cp-nf"])
             self.assertFalse(rows[1]["model_info"]["blocked"])
+
+    def test_clears_stale_cliproxy_cooldown_and_reprobes_to_unblock(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rows = [
+                self._cp_row("claude-fable-5-2", "cp-claude", "anthropic/claude-fable-5-2"),
+                self._cp_row("gpt-6-astra", "cp-codex", "openai/gpt-6-astra"),
+            ]
+            reset_calls = []
+
+            def fake_reset():
+                reset_calls.append(True)
+                return "service_restart"
+
+            def fake_health(mid):
+                if not reset_calls:
+                    return ("rate_limited", "all credentials for model are cooling down")
+                if mid == "cp-claude":
+                    return ("ok", "")
+                return ("rate_limited", "usage_limit_reached: the usage limit has been reached")
+
+            client = FakeClient()
+            actions = quarantine.cliproxy_recovery_sweep(
+                client, rows, fake_health,
+                home=home,
+                catalog_ids={"claude-fable-5-2", "gpt-6-astra"},
+                retired=set(),
+                apply=True,
+                workers=1,
+                now=1000.0,
+                reset_cooldowns=fake_reset,
+                reset_min_interval=600.0,
+            )
+            self.assertEqual(len(reset_calls), 1)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["deployment"], "cp-claude")
+            self.assertEqual(actions[0]["reason"], "cliproxy_recovered_after_service_restart")
+            self.assertFalse(rows[0]["model_info"]["blocked"])
+            self.assertTrue(rows[1]["model_info"]["blocked"])
+
+            # Within reset_min_interval (2 min later) without oauth change: no second reset
+            quarantine.cliproxy_recovery_sweep(
+                client, rows,
+                lambda _mid: ("rate_limited", "all credentials are cooling down"),
+                home=home,
+                catalog_ids={"claude-fable-5-2", "gpt-6-astra"},
+                retired=set(),
+                apply=True,
+                workers=1,
+                now=1120.0,
+                reset_cooldowns=fake_reset,
+                reset_min_interval=600.0,
+            )
+            self.assertEqual(len(reset_calls), 1)
+
+            # After reset_min_interval (15 min later): resets and re-probes again!
+            quarantine.cliproxy_recovery_sweep(
+                client, rows,
+                lambda _mid: ("rate_limited", "all credentials are cooling down"),
+                home=home,
+                catalog_ids={"claude-fable-5-2", "gpt-6-astra"},
+                retired=set(),
+                apply=True,
+                workers=1,
+                now=1900.0,
+                reset_cooldowns=fake_reset,
+                reset_min_interval=600.0,
+            )
+            self.assertEqual(len(reset_calls), 2)
+
+    def test_preview_never_resets_cliproxy_cooldowns(self):
+        rows = [self._cp_row("claude-fable-5-2", "cp-claude", "anthropic/claude-fable-5-2")]
+        reset_calls = []
+        actions = quarantine.cliproxy_recovery_sweep(
+            FakeClient(), rows,
+            lambda _mid: ("rate_limited", "all credentials are cooling down"),
+            catalog_ids={"claude-fable-5-2"},
+            retired=set(),
+            apply=False,
+            workers=1,
+            reset_cooldowns=lambda: (reset_calls.append(True), "service_restart")[1],
+        )
+        self.assertEqual(reset_calls, [])
+        self.assertEqual(actions, [])

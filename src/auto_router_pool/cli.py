@@ -32,6 +32,7 @@ from .apply import (
 from .client import (
     Client,
     deployment_health,
+    deployment_health_detail,
     models,
     probe,
     probe_decision_choice,
@@ -418,10 +419,11 @@ def run(args) -> int:
             )
             output["cliproxy_recovery"] = cliproxy_recovery_sweep(
                 litellm, rows,
-                lambda model_id: deployment_health(litellm, model_id),
+                lambda model_id: deployment_health_detail(litellm, model_id),
                 home=settings.home,
                 cliproxy_base=settings.cliproxy_base,
                 cliproxy_key=settings.cpkey,
+                management_key=os.environ.get("CLIPROXY_MANAGEMENT_KEY", ""),
                 apply=args.apply,
             )
         if args.sync_batch:
@@ -530,10 +532,11 @@ def run(args) -> int:
         # unblock deployments once new credentials or quota resets restore them.
         cliproxy_recovery = cliproxy_recovery_sweep(
             litellm, rows,
-            lambda model_id: deployment_health(litellm, model_id),
+            lambda model_id: deployment_health_detail(litellm, model_id),
             home=settings.home,
             cliproxy_base=settings.cliproxy_base,
             cliproxy_key=settings.cpkey,
+            management_key=os.environ.get("CLIPROXY_MANAGEMENT_KEY", ""),
             apply=args.apply,
         )
         if cliproxy_recovery and args.apply:

@@ -490,7 +490,95 @@ def live_failure_sweep(
 CLIPROXY_CREDENTIAL = "cliproxyapi-shared"
 CLIPROXY_MANUAL_BLOCK = "auto_pool_manual_block"
 CLIPROXY_UNAVAILABLE_RETRY_SECONDS = 6 * 3600
+CLIPROXY_COOLDOWN_RESET_MIN_INTERVAL = 600
+CLIPROXY_SERVICE = "agent-gateway-core.service"
 CLIPROXY_RECOVERY_MODES = frozenset({"chat", "completion", "responses"})
+
+
+def _parse_health(raw) -> tuple[str, str]:
+    if isinstance(raw, tuple) and len(raw) == 2:
+        return str(raw[0]), str(raw[1] or "").lower()
+    return str(raw), ""
+
+
+def _is_cliproxy_cooldown(verdict: str, detail: str) -> bool:
+    if verdict == "model_cooldown":
+        return True
+    if verdict == "rate_limited" and any(
+        marker in detail for marker in ("cooling down", "model_cooldown")
+    ):
+        return True
+    return False
+
+
+def _wait_cliproxy_ready(base: str, timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    url = base.rstrip("/") + "/v1/models"
+    while time.monotonic() < deadline:
+        try:
+            urllib.request.urlopen(urllib.request.Request(url), timeout=2.0)
+            return True
+        except urllib.error.HTTPError:
+            # 401/403 proves the HTTP server is up and serving requests.
+            return True
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.3)
+    return False
+
+
+def reset_cliproxy_cooldowns(
+    cliproxy_base: str = "http://127.0.0.1:8317",
+    *,
+    management_key: str = "",
+    service: str = CLIPROXY_SERVICE,
+    runner=subprocess.run,
+    ready_check=None,
+) -> str | None:
+    """Clear stale in-memory CLIProxyAPI cooldowns so probes hit upstream live.
+
+    Prefers the zero-downtime management API when ``management_key`` is set;
+    otherwise restarts the local systemd user service (which clears RAM-only
+    force-cooldowns when ``save-cooldown-status`` is false) and waits until the
+    listener accepts connections again.
+    """
+    base = cliproxy_base.rstrip("/")
+    if management_key:
+        for path in (
+            "/v0/management/routing/cooldown/reset",
+            "/v8/management/routing/cooldown/reset",
+        ):
+            req = urllib.request.Request(
+                base + path,
+                data=b"{}",
+                headers={
+                    "Authorization": "Bearer " + management_key,
+                    "X-Management-Key": management_key,
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if 200 <= getattr(resp, "status", 200) < 300:
+                        return "management_api"
+            except (OSError, urllib.error.URLError):
+                continue
+
+    if service:
+        try:
+            proc = runner(
+                ["systemctl", "--user", "restart", service],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(proc, "returncode", 1) == 0:
+            check = ready_check or (lambda: _wait_cliproxy_ready(base))
+            check()
+            return "service_restart"
+    return None
 
 
 def oauth_fingerprint(home: Path) -> str:
@@ -564,11 +652,14 @@ def cliproxy_recovery_sweep(
     home: Path | None = None,
     cliproxy_base: str = "http://127.0.0.1:8317",
     cliproxy_key: str | None = None,
+    management_key: str = "",
     catalog_ids: set[str] | None = None,
     retired: set[str] | None = None,
     apply: bool = False,
     workers: int = 4,
     now: float | None = None,
+    reset_cooldowns=None,
+    reset_min_interval: float = CLIPROXY_COOLDOWN_RESET_MIN_INTERVAL,
 ) -> list[dict]:
     """Re-probe blocked CLIProxyAPI deployments and unblock recovered ones.
 
@@ -669,17 +760,45 @@ def cliproxy_recovery_sweep(
             })
         return []
 
-    ordered_keys = sorted(groups)
-    rep_ids = [groups[key][0]["model_info"]["id"] for key in ordered_keys]
+    def _probe_keys(keys_to_probe: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[str, str]]:
+        rep_ids = [groups[k][0]["model_info"]["id"] for k in keys_to_probe]
+        if workers > 1 and len(rep_ids) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(rep_ids))) as pool:
+                raw_results = list(pool.map(health, rep_ids))
+        else:
+            raw_results = [health(mid) for mid in rep_ids]
+        return {k: _parse_health(r) for k, r in zip(keys_to_probe, raw_results)}
 
-    if workers > 1 and len(rep_ids) > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(rep_ids))) as pool:
-            verdicts = list(pool.map(health, rep_ids))
-    else:
-        verdicts = [health(mid) for mid in rep_ids]
+    ordered_keys = sorted(groups)
+    probed = _probe_keys(ordered_keys)
+
+    # CLIProxyAPI caches multi-day force-cooldowns in RAM, so probes return 429
+    # model_cooldown in 1ms without ever calling the upstream API. When any
+    # blocked deployment hits model_cooldown, clear CLIProxyAPI's stale cooldown
+    # once per sync window and immediately re-probe those models live.
+    cooldown_keys = [
+        k for k in ordered_keys if _is_cliproxy_cooldown(*probed[k])
+    ]
+    last_reset_ts = float(state.get("last_cooldown_reset_ts") or 0.0)
+    reset_method = None
+    if (
+        cooldown_keys
+        and apply
+        and (oauth_changed or (now_ts - last_reset_ts) >= reset_min_interval)
+    ):
+        resetter = reset_cooldowns or (
+            lambda: reset_cliproxy_cooldowns(
+                cliproxy_base, management_key=management_key
+            )
+        )
+        reset_method = resetter()
+        if reset_method:
+            last_reset_ts = now_ts
+            probed.update(_probe_keys(cooldown_keys))
 
     actions: list[dict] = []
-    for key, verdict in zip(ordered_keys, verdicts):
+    for key in ordered_keys:
+        verdict, _detail = probed[key]
         model_str, api_base = key
         state_key = f"{model_str}@{api_base}"
         if verdict == "ok":
@@ -713,12 +832,17 @@ def cliproxy_recovery_sweep(
                     info[MARKER] = False
                 if info.get(BUDGET_MARKER):
                     info[BUDGET_MARKER] = False
+                reason = (
+                    f"cliproxy_recovered_after_{reset_method}"
+                    if reset_method and key in cooldown_keys
+                    else "cliproxy_recovered"
+                )
                 actions.append({
                     "model": row["model_name"],
                     "deployment": deployment,
                     "upstream": model_str,
                     "action": "unblocked" if apply else "would_unblock",
-                    "reason": "cliproxy_recovered",
+                    "reason": reason,
                 })
         elif verdict == "unhealthy":
             # Permanent account/model errors (e.g. not_found) back off for 6h;
@@ -730,6 +854,7 @@ def cliproxy_recovery_sweep(
         atomic(state_path, {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "oauth_fingerprint": current_oauth_fp,
+            "last_cooldown_reset_ts": last_reset_ts,
             "backoff": backoff,
         })
     return actions
