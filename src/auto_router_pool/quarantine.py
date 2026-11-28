@@ -12,11 +12,22 @@ one model.
 """
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
 import json
+from pathlib import Path
 import subprocess
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
-from .extra_catalogs import litellm_container
+from .extra_catalogs import (
+    atomic,
+    config_api_keys,
+    litellm_container,
+    retired_names,
+)
 from .pool import MIN_INPUT_TOKENS, input_window
 
 MARKER = "auto_pool_quarantined"
@@ -473,4 +484,252 @@ def live_failure_sweep(
             "reason": breach,
         })
 
+    return actions
+
+
+CLIPROXY_CREDENTIAL = "cliproxyapi-shared"
+CLIPROXY_MANUAL_BLOCK = "auto_pool_manual_block"
+CLIPROXY_UNAVAILABLE_RETRY_SECONDS = 6 * 3600
+CLIPROXY_RECOVERY_MODES = frozenset({"chat", "completion", "responses"})
+
+
+def oauth_fingerprint(home: Path) -> str:
+    """Hash OAuth credential file metadata without ever reading token contents.
+
+    Adding, replacing, or refreshing a CLIProxyAPI credential file under
+    ``<home>/oauth`` changes this fingerprint, immediately invalidating any
+    failure backoff so recovered accounts are re-probed on the very next sync.
+    """
+    oauth_dir = Path(home) / "oauth"
+    if not oauth_dir.is_dir():
+        return ""
+    entries = []
+    for path in sorted(oauth_dir.iterdir(), key=lambda p: p.name):
+        if not path.is_file() or not path.name.endswith(".json"):
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        entries.append((path.name, st.st_mtime_ns, st.st_size))
+    return hashlib.sha256(json.dumps(entries).encode()).hexdigest()
+
+
+def cliproxy_catalog_ids(
+    home: Path,
+    base: str = "http://127.0.0.1:8317",
+    api_key: str | None = None,
+    timeout: float = 10.0,
+) -> set[str] | None:
+    """Return upstream model IDs currently advertised by CLIProxyAPI.
+
+    Returns ``None`` if CLIProxyAPI is not configured or unreachable, so the
+    recovery sweep fails closed without probing a dead proxy.
+    """
+    key = (api_key or "").strip()
+    if not key:
+        cfg = Path(home) / "core-config.yaml"
+        if cfg.exists():
+            try:
+                keys = config_api_keys(cfg.read_text())
+                key = keys[0] if keys else ""
+            except OSError:
+                key = ""
+    if not key:
+        return None
+    req = urllib.request.Request(
+        base.rstrip("/") + "/v1/models",
+        headers={"Authorization": "Bearer " + key, "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.load(resp)
+    except (OSError, urllib.error.URLError, ValueError):
+        return None
+    items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return None
+    return {
+        str(item["id"]).strip()
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip()
+    }
+
+
+def cliproxy_recovery_sweep(
+    client,
+    rows: list[dict],
+    health,
+    *,
+    home: Path | None = None,
+    cliproxy_base: str = "http://127.0.0.1:8317",
+    cliproxy_key: str | None = None,
+    catalog_ids: set[str] | None = None,
+    retired: set[str] | None = None,
+    apply: bool = False,
+    workers: int = 4,
+    now: float | None = None,
+) -> list[dict]:
+    """Re-probe blocked CLIProxyAPI deployments and unblock recovered ones.
+
+    CLIProxyAPI multiplexes multiple upstream OAuth accounts behind the single
+    ``cliproxyapi-shared`` credential. When an account hits a usage outage, its
+    deployments are blocked (either by quarantine, triage, or an earlier health
+    pass). Once new credentials are added or quotas reset, this sweep verifies
+    recovery via LiteLLM's ``/health?model_id=...`` (which probes blocked
+    deployments directly) and lifts the block automatically.
+
+    Safety boundaries:
+    - Never touches deployments outside ``cliproxyapi-shared``.
+    - Never lifts ``auto_pool_live_failure_blocked`` (owned by 24h live-failure
+      quarantine), ``auto_pool_manual_block``, retired models, internal ``__*``
+      aliases, or ``*-blocked`` aliases.
+    - Deduplicates probes by ``(litellm_params.model, api_base)``.
+    - Rate-limit/cooldown failures are retried every sync so quota resets are
+      picked up promptly; permanent non-rate-limit errors (e.g. account
+      ``not_found``) back off for 6 hours, and any change in ``<home>/oauth``
+      immediately clears all backoff.
+    """
+    retired_set = retired if retired is not None else (
+        retired_names(home) if home is not None else set()
+    )
+
+    candidates: list[dict] = []
+    for row in rows:
+        params = row.get("litellm_params") or {}
+        info = row.get("model_info") or {}
+        if params.get("litellm_credential_name") != CLIPROXY_CREDENTIAL:
+            continue
+        if not info.get("blocked") or not info.get("id"):
+            continue
+        name = str(row.get("model_name") or "")
+        if not name or name.startswith("__") or name.endswith("-blocked"):
+            continue
+        if name in retired_set:
+            continue
+        if info.get(LIVE_FAILURE_MARKER) or info.get(CLIPROXY_MANUAL_BLOCK):
+            continue
+        mode = str(info.get("mode") or "chat").lower()
+        if mode not in CLIPROXY_RECOVERY_MODES:
+            continue
+        if not str(params.get("model") or "").strip():
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        return []
+
+    if catalog_ids is None:
+        if home is None:
+            return []
+        catalog_ids = cliproxy_catalog_ids(
+            home, base=cliproxy_base, api_key=cliproxy_key
+        )
+        if not catalog_ids:
+            return []
+
+    now_ts = time.time() if now is None else float(now)
+    state_path = Path(home) / "cliproxy-recovery-state.json" if home is not None else None
+    state = {}
+    if state_path and state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = {}
+    current_oauth_fp = oauth_fingerprint(home) if home is not None else ""
+    oauth_changed = bool(current_oauth_fp) and current_oauth_fp != state.get("oauth_fingerprint")
+    backoff: dict[str, dict] = {} if oauth_changed else dict(state.get("backoff") or {})
+    # Prune expired backoff entries.
+    backoff = {
+        k: v for k, v in backoff.items()
+        if isinstance(v, dict)
+        and now_ts - float(v.get("ts") or 0) < CLIPROXY_UNAVAILABLE_RETRY_SECONDS
+    }
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in candidates:
+        params = row.get("litellm_params") or {}
+        model_str = str(params.get("model") or "").strip()
+        upstream = model_str.split("/", 1)[-1] if "/" in model_str else model_str
+        if upstream not in catalog_ids:
+            continue
+        api_base = str(params.get("api_base") or "").strip()
+        key = (model_str, api_base)
+        state_key = f"{model_str}@{api_base}"
+        if state_key in backoff:
+            continue
+        groups.setdefault(key, []).append(row)
+
+    if not groups:
+        if state_path and apply:
+            atomic(state_path, {
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "oauth_fingerprint": current_oauth_fp,
+                "backoff": backoff,
+            })
+        return []
+
+    ordered_keys = sorted(groups)
+    rep_ids = [groups[key][0]["model_info"]["id"] for key in ordered_keys]
+
+    if workers > 1 and len(rep_ids) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(rep_ids))) as pool:
+            verdicts = list(pool.map(health, rep_ids))
+    else:
+        verdicts = [health(mid) for mid in rep_ids]
+
+    actions: list[dict] = []
+    for key, verdict in zip(ordered_keys, verdicts):
+        model_str, api_base = key
+        state_key = f"{model_str}@{api_base}"
+        if verdict == "ok":
+            backoff.pop(state_key, None)
+            for row in groups[key]:
+                info = row.get("model_info") or {}
+                deployment = info["id"]
+                if apply:
+                    res = client.post("/model/unblock", {"model_id": deployment})
+                    if res.get("error_status") is not None:
+                        actions.append({
+                            "model": row["model_name"],
+                            "deployment": deployment,
+                            "upstream": model_str,
+                            "action": "failed",
+                            "detail": f"unblock_{res['error_status']}",
+                        })
+                        continue
+                    clear_fields = {}
+                    if info.get(MARKER):
+                        clear_fields[MARKER] = False
+                    if info.get(BUDGET_MARKER):
+                        clear_fields[BUDGET_MARKER] = False
+                    if clear_fields:
+                        client.patch(
+                            f"/model/{deployment}/update",
+                            {"model_info": clear_fields},
+                        )
+                info["blocked"] = False
+                if info.get(MARKER):
+                    info[MARKER] = False
+                if info.get(BUDGET_MARKER):
+                    info[BUDGET_MARKER] = False
+                actions.append({
+                    "model": row["model_name"],
+                    "deployment": deployment,
+                    "upstream": model_str,
+                    "action": "unblocked" if apply else "would_unblock",
+                    "reason": "cliproxy_recovered",
+                })
+        elif verdict == "unhealthy":
+            # Permanent account/model errors (e.g. not_found) back off for 6h;
+            # rate_limited / cooldown / unknown are NOT backed off so quota resets
+            # are caught on the next sync.
+            backoff[state_key] = {"ts": now_ts, "verdict": verdict}
+
+    if state_path and apply:
+        atomic(state_path, {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "oauth_fingerprint": current_oauth_fp,
+            "backoff": backoff,
+        })
     return actions

@@ -1,3 +1,4 @@
+from pathlib import Path
 import unittest
 
 from auto_router_pool import quarantine
@@ -376,3 +377,130 @@ class LiveFailureSweepTest(unittest.TestCase):
             stdout = ""
 
         self.assertEqual(quarantine.spend_failure_stats(runner=lambda *a, **k: Fail()), [])
+
+
+class CliproxyRecoverySweepTest(unittest.TestCase):
+    def _cp_row(self, name, dep_id, upstream, *, blocked=True, extra_info=None):
+        info = {"id": dep_id, "mode": "chat", "blocked": blocked}
+        if extra_info:
+            info.update(extra_info)
+        return {
+            "model_name": name,
+            "litellm_params": {
+                "model": upstream,
+                "api_base": "http://192.168.68.3:8317/v1",
+                "litellm_credential_name": quarantine.CLIPROXY_CREDENTIAL,
+            },
+            "model_info": info,
+        }
+
+    def test_unblocks_recovered_cliproxy_deployments_and_deduplicates_probes(self):
+        rows = [
+            self._cp_row("claude-sonnet-5-5", "cp-1", "anthropic/claude-sonnet-5-5",
+                         extra_info={quarantine.MARKER: True}),
+            self._cp_row("claude-sonnet-5-5-high", "cp-2", "anthropic/claude-sonnet-5-5"),
+            self._cp_row("gpt-6-astra", "cp-3", "openai/gpt-6-astra"),
+        ]
+        probed = []
+
+        def fake_health(mid):
+            probed.append(mid)
+            return "ok" if mid == "cp-1" else "rate_limited"
+
+        client = FakeClient()
+        actions = quarantine.cliproxy_recovery_sweep(
+            client, rows, fake_health,
+            catalog_ids={"claude-sonnet-5-5", "gpt-6-astra"},
+            retired=set(),
+            apply=True,
+            workers=1,
+        )
+        # cp-1 and cp-2 share anthropic/claude-sonnet-5-5 -> probed once, both unblocked.
+        self.assertEqual(probed, ["cp-1", "cp-3"])
+        self.assertEqual([a["deployment"] for a in actions], ["cp-1", "cp-2"])
+        self.assertTrue(all(a["action"] == "unblocked" for a in actions))
+        self.assertFalse(rows[0]["model_info"]["blocked"])
+        self.assertFalse(rows[0]["model_info"][quarantine.MARKER])
+        self.assertFalse(rows[1]["model_info"]["blocked"])
+        self.assertTrue(rows[2]["model_info"]["blocked"])
+        unblocks = [c[2]["model_id"] for c in client.calls if c[1] == "/model/unblock"]
+        self.assertEqual(unblocks, ["cp-1", "cp-2"])
+
+    def test_respects_safety_exclusions_and_catalog_membership(self):
+        rows = [
+            self._cp_row("__advisor_helper", "cp-int", "anthropic/claude-fable-5-2"),
+            self._cp_row("claude-haiku-4-5-blocked", "cp-blk", "anthropic/claude-fable-5-2"),
+            self._cp_row("claude-opus-4-5", "cp-ret", "anthropic/claude-opus-5-5"),
+            self._cp_row("claude-fable-5-2", "cp-live", "anthropic/claude-fable-5-2",
+                         extra_info={quarantine.LIVE_FAILURE_MARKER: True}),
+            self._cp_row("claude-fable-5-1", "cp-man", "anthropic/claude-fable-5-1",
+                         extra_info={quarantine.CLIPROXY_MANUAL_BLOCK: True}),
+            self._cp_row("gpt-5.5", "cp-absent", "openai/gpt-5.5"),
+            {
+                "model_name": "gpt-6-astra",
+                "litellm_params": {"model": "openai/gpt-6-astra", "litellm_credential_name": "OpenAI-API-other"},
+                "model_info": {"id": "other-1", "mode": "chat", "blocked": True},
+            },
+        ]
+        probed = []
+        client = FakeClient()
+        actions = quarantine.cliproxy_recovery_sweep(
+            client, rows, lambda mid: (probed.append(mid), "ok")[1],
+            catalog_ids={"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5"},
+            retired={"claude-opus-4-5"},
+            apply=True,
+            workers=1,
+        )
+        self.assertEqual(probed, [])
+        self.assertEqual(actions, [])
+        self.assertEqual(client.calls, [])
+
+    def test_unhealthy_backs_off_but_oauth_change_resets_backoff_and_rate_limit_retries(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            oauth = home / "oauth"
+            oauth.mkdir()
+            (oauth / "devin.json").write_text("{}")
+
+            rows = [
+                self._cp_row("gpt-6-astra", "cp-rl", "openai/gpt-6-astra"),
+                self._cp_row("deepseek-v4-pro", "cp-nf", "deepseek/devin/deepseek-v4-pro"),
+            ]
+            probed_1 = []
+            def h1(mid):
+                probed_1.append(mid)
+                return "rate_limited" if mid == "cp-rl" else "unhealthy"
+
+            client = FakeClient()
+            quarantine.cliproxy_recovery_sweep(
+                client, rows, h1, home=home,
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro"},
+                retired=set(), apply=True, workers=1, now=1000.0,
+            )
+            self.assertEqual(sorted(probed_1), ["cp-nf", "cp-rl"])
+
+            # Second run 15 min later (no oauth change): cp-nf is backed off, cp-rl IS retried!
+            probed_2 = []
+            def h2(mid):
+                probed_2.append(mid)
+                return "ok"
+            actions_2 = quarantine.cliproxy_recovery_sweep(
+                client, rows, h2, home=home,
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro"},
+                retired=set(), apply=True, workers=1, now=1900.0,
+            )
+            self.assertEqual(probed_2, ["cp-rl"])
+            self.assertEqual([a["deployment"] for a in actions_2], ["cp-rl"])
+
+            # Adding a new credential file in oauth/ immediately clears backoff for cp-nf!
+            (oauth / "devin-new.json").write_text('{"new": true}')
+            probed_3 = []
+            actions_3 = quarantine.cliproxy_recovery_sweep(
+                client, rows, lambda mid: (probed_3.append(mid), "ok")[1], home=home,
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro"},
+                retired=set(), apply=True, workers=1, now=2000.0,
+            )
+            self.assertEqual(probed_3, ["cp-nf"])
+            self.assertEqual([a["deployment"] for a in actions_3], ["cp-nf"])
+            self.assertFalse(rows[1]["model_info"]["blocked"])

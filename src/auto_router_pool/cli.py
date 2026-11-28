@@ -72,7 +72,13 @@ from .pool import (
     free_gaps,
     free_models,
 )
-from .quarantine import budget_sweep, live_failure_sweep, spend_failure_stats
+from .quarantine import (
+    MARKER as QUARANTINE_MARKER,
+    budget_sweep,
+    cliproxy_recovery_sweep,
+    live_failure_sweep,
+    spend_failure_stats,
+)
 from .quarantine import sweep as quarantine_sweep
 from .registry import ensure_guests, load_guests, registered
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
@@ -247,10 +253,16 @@ def triage_deployments(litellm, rows, name, *, apply=False):
         result = litellm.post("/model/block", {"model_id": model_id})
         if result.get("error_status") is not None:
             continue
+        if hasattr(litellm, "patch"):
+            litellm.patch(
+                f"/model/{model_id}/update",
+                {"model_info": {QUARANTINE_MARKER: True}},
+            )
         for row in rows:
             info = row.get("model_info") or {}
             if info.get("id") == model_id:
                 info["blocked"] = True
+                info[QUARANTINE_MARKER] = True
         blocked.append(model_id)
     return blocked, "blocked"
 
@@ -404,6 +416,14 @@ def run(args) -> int:
             output["catalogs"] = sync_provider_catalogs(
                 litellm, settings.home, rows, prices, apply=args.apply
             )
+            output["cliproxy_recovery"] = cliproxy_recovery_sweep(
+                litellm, rows,
+                lambda model_id: deployment_health(litellm, model_id),
+                home=settings.home,
+                cliproxy_base=settings.cliproxy_base,
+                cliproxy_key=settings.cpkey,
+                apply=args.apply,
+            )
         if args.sync_batch:
             output["batch_sync"] = sync_batch(
                 litellm, rows, settings.home, prices=prices, apply=args.apply
@@ -492,6 +512,7 @@ def run(args) -> int:
     # Blocks are capacity, so the same probe that chooses a model keeps the flags
     # honest: a group that answers is unblocked, one that cannot is narrowed.
     budget_quarantine: list[dict] = []
+    cliproxy_recovery: list[dict] = []
     quarantine: list[dict] = []
     live_failure_quarantine: list[dict] = []
     if args.quarantine:
@@ -503,6 +524,19 @@ def run(args) -> int:
             apply=args.apply,
         )
         if budget_quarantine and args.apply:
+            rows = models(litellm)
+
+        # CLIProxyAPI multiplexes OAuth accounts behind one shared credential:
+        # unblock deployments once new credentials or quota resets restore them.
+        cliproxy_recovery = cliproxy_recovery_sweep(
+            litellm, rows,
+            lambda model_id: deployment_health(litellm, model_id),
+            home=settings.home,
+            cliproxy_base=settings.cliproxy_base,
+            cliproxy_key=settings.cpkey,
+            apply=args.apply,
+        )
+        if cliproxy_recovery and args.apply:
             rows = models(litellm)
 
         managed: set[str] = set()
@@ -843,6 +877,7 @@ def run(args) -> int:
         "classifier": classifier,
         "quarantine": quarantine,
         "budget_quarantine": budget_quarantine,
+        "cliproxy_recovery": cliproxy_recovery,
         "live_failure_quarantine": live_failure_quarantine,
         # Every group that could classify if it answered: a decision-only model,
         # or a chat model that also serves /v1/decisions.
