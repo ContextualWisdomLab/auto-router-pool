@@ -32,6 +32,7 @@ from .apply import (
 from .client import (
     Client,
     deployment_health,
+    deployment_health_detail,
     models,
     probe,
     probe_decision_choice,
@@ -46,6 +47,7 @@ from .maintenance import (
     context_sync_pass,
     effort_suffix_pass,
     health_report,
+    price_sync_pass,
     prompt_cache_drop_pass,
     provider_prefix_pass,
     repair_cooldowns,
@@ -71,7 +73,13 @@ from .pool import (
     free_gaps,
     free_models,
 )
-from .quarantine import budget_sweep
+from .quarantine import (
+    TRIAGE_MARKER,
+    budget_sweep,
+    cliproxy_recovery_sweep,
+    live_failure_sweep,
+    spend_failure_stats,
+)
 from .quarantine import sweep as quarantine_sweep
 from .registry import ensure_guests, load_guests, registered
 from .tiers import FRONTIER, ROUTERS, policies, routers, top_effort
@@ -246,10 +254,16 @@ def triage_deployments(litellm, rows, name, *, apply=False):
         result = litellm.post("/model/block", {"model_id": model_id})
         if result.get("error_status") is not None:
             continue
+        if hasattr(litellm, "patch"):
+            litellm.patch(
+                f"/model/{model_id}/update",
+                {"model_info": {TRIAGE_MARKER: True}},
+            )
         for row in rows:
             info = row.get("model_info") or {}
             if info.get("id") == model_id:
                 info["blocked"] = True
+                info[TRIAGE_MARKER] = True
         blocked.append(model_id)
     return blocked, "blocked"
 
@@ -403,6 +417,15 @@ def run(args) -> int:
             output["catalogs"] = sync_provider_catalogs(
                 litellm, settings.home, rows, prices, apply=args.apply
             )
+            output["cliproxy_recovery"] = cliproxy_recovery_sweep(
+                litellm, rows,
+                lambda model_id: deployment_health_detail(litellm, model_id),
+                home=settings.home,
+                cliproxy_base=settings.cliproxy_base,
+                cliproxy_key=settings.cpkey,
+                management_key=os.environ.get("CLIPROXY_MANAGEMENT_KEY", ""),
+                apply=args.apply,
+            )
         if args.sync_batch:
             output["batch_sync"] = sync_batch(
                 litellm, rows, settings.home, prices=prices, apply=args.apply
@@ -422,6 +445,13 @@ def run(args) -> int:
             )
             output["chat_only_transport"] = chat_only_transport_pass(
                 litellm, rows, apply=args.apply
+            )
+            if args.apply and any(
+                change["action"] == "updated" for change in output["effort_suffix"]
+            ):
+                rows = models(litellm)
+            output["price_sync"] = price_sync_pass(
+                litellm, rows, prices, apply=args.apply
             )
         if args.repair_cooldowns:
             output["cooldowns"] = repair_cooldowns(
@@ -484,7 +514,9 @@ def run(args) -> int:
     # Blocks are capacity, so the same probe that chooses a model keeps the flags
     # honest: a group that answers is unblocked, one that cannot is narrowed.
     budget_quarantine: list[dict] = []
+    cliproxy_recovery: list[dict] = []
     quarantine: list[dict] = []
+    live_failure_quarantine: list[dict] = []
     if args.quarantine:
         # Budget is per key: one budget-exceeded answer blocks every deployment
         # sharing that credential, even when a sibling key still answers.
@@ -494,6 +526,20 @@ def run(args) -> int:
             apply=args.apply,
         )
         if budget_quarantine and args.apply:
+            rows = models(litellm)
+
+        # CLIProxyAPI multiplexes OAuth accounts behind one shared credential:
+        # unblock deployments once new credentials or quota resets restore them.
+        cliproxy_recovery = cliproxy_recovery_sweep(
+            litellm, rows,
+            lambda model_id: deployment_health_detail(litellm, model_id),
+            home=settings.home,
+            cliproxy_base=settings.cliproxy_base,
+            cliproxy_key=settings.cpkey,
+            management_key=os.environ.get("CLIPROXY_MANAGEMENT_KEY", ""),
+            apply=args.apply,
+        )
+        if cliproxy_recovery and args.apply:
             rows = models(litellm)
 
         managed: set[str] = set()
@@ -519,8 +565,16 @@ def run(args) -> int:
         quarantine = quarantine_sweep(
             litellm, rows, managed,
             lambda name: probe(litellm, name), apply=args.apply,
+            health=lambda model_id: deployment_health(litellm, model_id),
         )
         if quarantine and args.apply:
+            rows = models(litellm)
+
+        live_failure_quarantine = live_failure_sweep(
+            litellm, rows, managed, spend_failure_stats(),
+            apply=args.apply,
+        )
+        if live_failure_quarantine and args.apply:
             rows = models(litellm)
 
     # LiteLLM's registrations are the routing truth: a model the proxy lists but
@@ -827,6 +881,8 @@ def run(args) -> int:
         "classifier": classifier,
         "quarantine": quarantine,
         "budget_quarantine": budget_quarantine,
+        "cliproxy_recovery": cliproxy_recovery,
+        "live_failure_quarantine": live_failure_quarantine,
         # Every group that could classify if it answered: a decision-only model,
         # or a chat model that also serves /v1/decisions.
         "classifier_candidates": classifier_candidates(

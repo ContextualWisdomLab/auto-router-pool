@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from auto_router_pool import pool
 
@@ -48,6 +49,14 @@ class FingerprintTest(unittest.TestCase):
             pool.fingerprint(self.rows(False), ["model-primary"]),
             pool.fingerprint(self.rows(True), ["model-primary"]),
         )
+
+    def test_context_floor_change_invalidates_watch_fingerprint(self):
+        rows, names = self.rows(False), ["model-primary"]
+        previous = pool.fingerprint(rows, names)
+        with mock.patch.object(pool, "MIN_INPUT_TOKENS", pool.MIN_INPUT_TOKENS + 1):
+            current = pool.fingerprint(rows, names)
+            self.assertNotEqual(current, previous)
+            self.assertEqual(current, pool.fingerprint(rows, names))
 
     def test_catalogue_change_changes_fingerprint(self):
         self.assertNotEqual(
@@ -107,7 +116,16 @@ class ContextFloorTest(unittest.TestCase):
         self.assertEqual(pool.group_state(self.rows(65536), "m"), (False, "context_below_floor"))
 
     def test_floor_is_inclusive(self):
-        self.assertTrue(pool.group_state(self.rows(128000), "m")[0])
+        self.assertTrue(pool.group_state(self.rows(200000), "m")[0])
+        self.assertEqual(pool.group_state(self.rows(199999), "m"), (False, "context_below_floor"))
+
+    def test_blocked_deployment_does_not_inflate_active_window(self):
+        rows = [
+            {"model_name": "m", "model_info": {"max_input_tokens": 131072, "blocked": False}},
+            {"model_name": "m", "model_info": {"max_input_tokens": 1000000, "blocked": True}},
+        ]
+        self.assertEqual(pool.input_window(rows, "m"), 131072)
+        self.assertEqual(pool.group_state(rows, "m"), (False, "context_below_floor"))
 
     def test_custom_floor(self):
         self.assertEqual(

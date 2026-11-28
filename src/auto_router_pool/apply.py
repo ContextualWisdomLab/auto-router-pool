@@ -62,6 +62,8 @@ def context_cap(rows: list[dict], tiers: dict) -> int | None:
     interactive: set[str] = set()
     for row in rows:
         info = row.get("model_info") or {}
+        if info.get("blocked"):
+            continue
         name = row["model_name"]
         # An image, video or embedding deployment never receives the routed chat
         # request, so its window cannot bound what the router advertises.

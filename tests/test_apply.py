@@ -56,6 +56,15 @@ class ContextCapTest(unittest.TestCase):
     def test_empty_tiers_have_no_floor(self):
         self.assertIsNone(apply.context_cap([model("router", 500000)], {}))
 
+    def test_blocked_deployment_does_not_lower_context_cap(self):
+        rows = [
+            model("router", 500000, TIERS),
+            {"model_name": "small", "model_info": {"id": "s-blocked", "max_input_tokens": 131072, "blocked": True}},
+            {"model_name": "small", "model_info": {"id": "s-live", "max_input_tokens": 1048576, "blocked": False}},
+            model("large", 524288),
+        ]
+        self.assertEqual(apply.context_cap(rows, TIERS), 524288)
+
     def test_drift_lists_routers_above_their_tiers(self):
         rows = [
             router("auto", 500000, {"SIMPLE": [("small", "low")]}),

@@ -224,5 +224,79 @@ class ChatOnlyTransportTest(unittest.TestCase):
         self.assertEqual(client.calls, [])
 
 
+
+class PriceSyncPassTest(unittest.TestCase):
+    PRICES = {
+        "openrouter/bytedance-seed/seed-1.6": {
+            "litellm_provider": "openrouter",
+            "mode": "chat",
+            "input_cost_per_token": 2.5e-07,
+            "output_cost_per_token": 2e-06,
+        },
+        "xai/grok-imagine-image-2.0": {
+            "litellm_provider": "xai",
+            "mode": "image_generation",
+            "input_cost_per_image": 0.02,
+            "output_cost_per_image": 0.02,
+        },
+    }
+
+    def test_fills_local_free_and_catalog_prices_without_overwriting_existing(self):
+        local_row = row("gemma-4-e4b", "l1", model="lm_studio/google/gemma-4-e4b", custom_llm_provider="lm_studio")
+        free_row = row("nemotron-openrouter", "f1", model="openrouter/nvidia/nemotron:free", custom_llm_provider="openrouter")
+        catalog_row = row("seed-1.6", "c1", model="openai/seed-1.6", custom_llm_provider="openai")
+        image_row = {
+            "model_name": "grok-imagine-image-2.0",
+            "litellm_params": {"model": "xai/grok-imagine-image-2.0", "custom_llm_provider": "xai"},
+            "model_info": {"id": "i1", "mode": "image_generation"},
+        }
+        already_priced = {
+            "model_name": "seed-1.6",
+            "litellm_params": {"model": "openai/seed-1.6"},
+            "model_info": {"id": "p1", "input_cost_per_token": 1e-06, "output_cost_per_token": 2e-06},
+        }
+        router_row = row("auto-advisor", "r1", model="auto_router/complexity_router")
+
+        client = FakeClient()
+        changes = maintenance.price_sync_pass(
+            client,
+            [local_row, free_row, catalog_row, image_row, already_priced, router_row],
+            self.PRICES,
+            apply=True,
+        )
+        self.assertEqual([c["deployment"] for c in changes], ["l1", "f1", "c1", "i1"])
+        self.assertEqual(changes[0]["costs"], {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0})
+        self.assertEqual(changes[1]["costs"], {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0})
+        self.assertEqual(changes[2]["costs"], {"input_cost_per_token": 2.5e-07, "output_cost_per_token": 2e-06})
+        self.assertEqual(changes[2]["price_key"], "openrouter/bytedance-seed/seed-1.6")
+        self.assertEqual(changes[3]["costs"], {"input_cost_per_image": 0.02, "output_cost_per_image": 0.02})
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(
+            client.calls[0][2]["litellm_params"],
+            {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0},
+        )
+        self.assertEqual(
+            client.calls[2][2]["litellm_params"],
+            {"input_cost_per_token": 2.5e-07, "output_cost_per_token": 2e-06},
+        )
+
+    def test_price_backfill_preserves_explicit_benchmark_aliases(self):
+        for alias in ("aa_base_model", "benchmark_base"):
+            with self.subTest(alias=alias):
+                deployment = row("seed-1.6", "c1", model="openai/seed-1.6")
+                deployment["model_info"][alias] = "operator-alias"
+                client = FakeClient()
+                changes = maintenance.price_sync_pass(client, [deployment], self.PRICES, apply=True)
+                self.assertEqual(changes[0]["action"], "updated")
+                self.assertNotIn("model_info", client.calls[0][2])
+
+    def test_preview_writes_nothing(self):
+        rows = [row("seed-1.6", "c1", model="openai/seed-1.6")]
+        client = FakeClient()
+        changes = maintenance.price_sync_pass(client, rows, self.PRICES, apply=False)
+        self.assertEqual(changes[0]["action"], "would_update")
+        self.assertEqual(client.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

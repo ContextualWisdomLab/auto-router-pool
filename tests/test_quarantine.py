@@ -1,3 +1,4 @@
+from pathlib import Path
 import unittest
 
 from auto_router_pool import quarantine
@@ -101,6 +102,18 @@ class BudgetSweepTest(unittest.TestCase):
             [{"model_id": "1"}],
         )
 
+    def test_budget_recovery_preserves_manual_and_triage_blocks(self):
+        rows = [budget_row("a", "1", blocked=True, marked=True),
+                budget_row("b", "2", blocked=True, marked=True)]
+        for deployment, marker in zip(rows, (quarantine.CLIPROXY_MANUAL_BLOCK,
+                                              quarantine.TRIAGE_MARKER)):
+            deployment["model_info"][marker] = True
+        client = FakeClient()
+        actions = quarantine.budget_sweep(client, rows, lambda mid: "ok", apply=True)
+        self.assertEqual([action["action"] for action in actions], ["cleared", "cleared"])
+        self.assertTrue(all(deployment["model_info"]["blocked"] for deployment in rows))
+        self.assertNotIn("/model/unblock", [call[1] for call in client.calls])
+
     def test_another_failure_changes_nothing(self):
         rows = [budget_row("a", "1")]
         self.assertEqual(
@@ -120,6 +133,29 @@ class BudgetSweepTest(unittest.TestCase):
 
 
 class SweepTest(unittest.TestCase):
+    def test_group_success_only_clears_synthetic_until_triage_health_recovers(self):
+        triaged = row("g", "triage", blocked=True)
+        triaged["model_info"][quarantine.TRIAGE_MARKER] = True
+        rows = [row("g", "live"), row("g", "synthetic", blocked=True, marked=True), triaged]
+        client = FakeClient()
+        probed = []
+
+        def health(mid):
+            probed.append(mid)
+            return "rate_limited"
+
+        result = quarantine.sweep(client, rows, ["g"], lambda _: (True, ""), True, health=health)
+        self.assertEqual(probed, ["triage"])
+        self.assertEqual([item["deployment"] for item in result], ["synthetic"])
+        self.assertTrue(triaged["model_info"]["blocked"])
+
+        result = quarantine.sweep(
+            client, rows, ["g"], lambda _: (True, ""), True,
+            health=lambda mid: "ok" if mid == "triage" else "unknown",
+        )
+        self.assertEqual([item["deployment"] for item in result], ["triage"])
+        self.assertFalse(triaged["model_info"]["blocked"])
+
     def test_a_failing_group_is_narrowed_not_removed(self):
         rows = [row("g", "a"), row("g", "b")]
         client = FakeClient()
@@ -144,8 +180,453 @@ class SweepTest(unittest.TestCase):
         self.assertIn(("POST", "/model/unblock", {"model_id": "a"}), client.calls)
         self.assertNotIn(("POST", "/model/unblock", {"model_id": "b"}), client.calls)
 
+    def test_recovery_considers_blocked_context_when_live_sibling_is_too_small(self):
+        rows = [row("g", "long", blocked=True, marked=True), row("g", "short", window=10000)]
+        client = FakeClient()
+        actions = quarantine.sweep(client, rows, ["g"], lambda name: (True, "ok"), apply=True)
+        self.assertEqual(actions, [{"model": "g", "deployment": "long", "action": "unblocked"}])
+
     def test_a_preview_run_writes_nothing(self):
         rows = [row("g", "a"), row("g", "b")]
         client = FakeClient()
         quarantine.sweep(client, rows, ["g"], lambda name: (False, "unavailable_429"))
         self.assertEqual(client.calls, [])
+
+class LiveFailureSweepTest(unittest.TestCase):
+    def test_blocks_managed_deployment_failing_on_live_surface_even_when_acompletion_passes(self):
+        from datetime import datetime, timezone
+
+        rows = [
+            {
+                "model_name": "glm-5.3-flash",
+                "litellm_params": {"model": "hosted_vllm/z-ai/glm-5.3-flash"},
+                "model_info": {"id": "glm-1", "mode": "chat", "blocked": False, "max_input_tokens": 1000000},
+            },
+            row("claude-opus-5-5", "opus-1"),
+        ]
+        stats = [
+            {"model_id": "glm-1", "model": "hosted_vllm/z-ai/glm-5.3-flash", "call_type": "acompletion", "ok": 40, "bad": 0},
+            {"model_id": "glm-1", "model": "hosted_vllm/z-ai/glm-5.3-flash", "call_type": "anthropic_messages", "ok": 1, "bad": 41},
+            {"model_id": "opus-1", "model": "openai/claude-opus-5-5", "call_type": "anthropic_messages", "ok": 300, "bad": 2},
+        ]
+        client = FakeClient()
+        now = datetime(2026, 11, 27, 10, 0, 0, tzinfo=timezone.utc)
+        actions = quarantine.live_failure_sweep(
+            client, rows, ["glm-5.3-flash", "claude-opus-5-5"], stats, apply=True, now=now
+        )
+        self.assertEqual(actions, [{
+            "model": "glm-5.3-flash",
+            "deployment": "glm-1",
+            "action": "blocked",
+            "reason": "anthropic_messages:41/42",
+        }])
+        self.assertTrue(rows[0]["model_info"]["blocked"])
+        self.assertTrue(rows[0]["model_info"][quarantine.LIVE_FAILURE_MARKER])
+        self.assertEqual(rows[0]["model_info"][quarantine.LIVE_FAILURE_AT], "2026-11-27T10:00:00Z")
+        self.assertFalse(rows[1]["model_info"]["blocked"])
+        self.assertIn(("POST", "/model/block", {"model_id": "glm-1"}), client.calls)
+
+    def test_synthetic_sweep_does_not_unblock_live_failure_marker(self):
+        rows = [
+            {
+                "model_name": "glm-5.3-flash",
+                "litellm_params": {"model": "hosted_vllm/z-ai/glm-5.3-flash"},
+                "model_info": {
+                    "id": "glm-1",
+                    "mode": "chat",
+                    "blocked": True,
+                    "max_input_tokens": 1000000,
+                    quarantine.LIVE_FAILURE_MARKER: True,
+                },
+            }
+        ]
+        client = FakeClient()
+        actions = quarantine.sweep(client, rows, ["glm-5.3-flash"], lambda name: (True, "ok"), apply=True)
+        self.assertEqual(actions, [])
+        self.assertTrue(rows[0]["model_info"]["blocked"])
+        self.assertEqual(client.calls, [])
+
+    def test_transport_migration_resets_stale_model_string_failures(self):
+        rows = [
+            {
+                "model_name": "nemotron-3.5-lightning",
+                "litellm_params": {"model": "hosted_vllm/nvidia/nemotron-3.5-lightning"},
+                "model_info": {"id": "nem-1", "mode": "chat", "blocked": False, "max_input_tokens": 1000000},
+            },
+            row("claude-opus-5-5", "opus-1"),
+        ]
+        stats = [
+            {"model_id": "nem-1", "model": "openai/nvidia/nemotron-3.5-lightning", "call_type": "aresponses", "ok": 0, "bad": 10},
+        ]
+        client = FakeClient()
+        actions = quarantine.live_failure_sweep(client, rows, ["nemotron-3.5-lightning"], stats, apply=True)
+        self.assertEqual(actions, [])
+        self.assertFalse(rows[0]["model_info"]["blocked"])
+
+    def test_unmanaged_models_are_ignored(self):
+        rows = [
+            {
+                "model_name": "clef",
+                "litellm_params": {"model": "hosted_vllm/clef"},
+                "model_info": {"id": "clef-1", "mode": "chat", "blocked": False, "max_input_tokens": 200000},
+            },
+            row("claude-opus-5-5", "opus-1"),
+        ]
+        stats = [
+            {"model_id": "clef-1", "model": "hosted_vllm/clef", "call_type": "acompletion", "ok": 0, "bad": 10},
+        ]
+        actions = quarantine.live_failure_sweep(FakeClient(), rows, ["claude-opus-5-5"], stats, apply=True)
+        self.assertEqual(actions, [])
+        self.assertFalse(rows[0]["model_info"]["blocked"])
+
+    def test_never_empties_last_eligible_chat_model(self):
+        rows = [
+            {
+                "model_name": "glm-5.3-flash",
+                "litellm_params": {"model": "hosted_vllm/z-ai/glm-5.3-flash"},
+                "model_info": {"id": "glm-1", "mode": "chat", "blocked": False, "max_input_tokens": 1000000},
+            }
+        ]
+        stats = [
+            {"model_id": "glm-1", "model": "hosted_vllm/z-ai/glm-5.3-flash", "call_type": "anthropic_messages", "ok": 0, "bad": 10},
+        ]
+        client = FakeClient()
+        actions = quarantine.live_failure_sweep(client, rows, ["glm-5.3-flash"], stats, apply=True)
+        self.assertEqual(actions[0]["action"], "kept")
+        self.assertFalse(rows[0]["model_info"]["blocked"])
+        self.assertEqual(client.calls, [])
+
+    def test_cooldown_unblocks_only_our_live_failure_mark_after_retry_hours(self):
+        from datetime import datetime, timezone
+
+        rows = [
+            {
+                "model_name": "glm-5.3-flash",
+                "litellm_params": {"model": "hosted_vllm/z-ai/glm-5.3-flash"},
+                "model_info": {
+                    "id": "glm-auto",
+                    "mode": "chat",
+                    "blocked": True,
+                    "max_input_tokens": 1000000,
+                    quarantine.LIVE_FAILURE_MARKER: True,
+                    quarantine.LIVE_FAILURE_AT: "2026-11-26T09:00:00Z",
+                    quarantine.LIVE_FAILURE_REASON: "anthropic_messages:41/42",
+                },
+            },
+            {
+                "model_name": "glm-5.3-flash",
+                "litellm_params": {"model": "hosted_vllm/z-ai/glm-5.3-flash"},
+                "model_info": {
+                    "id": "glm-manual",
+                    "mode": "chat",
+                    "blocked": True,
+                    "max_input_tokens": 1000000,
+                },
+            },
+        ]
+        client = FakeClient()
+        early = datetime(2026, 11, 27, 8, 59, 0, tzinfo=timezone.utc)
+        self.assertEqual(quarantine.live_failure_sweep(client, rows, [], [], apply=True, now=early), [])
+        later = datetime(2026, 11, 27, 9, 0, 1, tzinfo=timezone.utc)
+        actions = quarantine.live_failure_sweep(client, rows, [], [], apply=True, now=later)
+        self.assertEqual(actions, [{
+            "model": "glm-5.3-flash",
+            "deployment": "glm-auto",
+            "action": "unblocked",
+            "reason": "live_failure_cooldown_elapsed",
+        }])
+        self.assertFalse(rows[0]["model_info"]["blocked"])
+        self.assertFalse(rows[0]["model_info"][quarantine.LIVE_FAILURE_MARKER])
+        self.assertTrue(rows[1]["model_info"]["blocked"])
+
+    def test_preview_writes_nothing(self):
+        rows = [
+            {
+                "model_name": "glm-5.3-flash",
+                "litellm_params": {"model": "hosted_vllm/z-ai/glm-5.3-flash"},
+                "model_info": {"id": "glm-1", "mode": "chat", "blocked": False, "max_input_tokens": 1000000},
+            },
+            row("claude-opus-5-5", "opus-1"),
+        ]
+        stats = [
+            {"model_id": "glm-1", "model": "hosted_vllm/z-ai/glm-5.3-flash", "call_type": "anthropic_messages", "ok": 0, "bad": 8},
+        ]
+        client = FakeClient()
+        actions = quarantine.live_failure_sweep(client, rows, ["glm-5.3-flash"], stats, apply=False)
+        self.assertEqual(actions[0]["action"], "blocked")
+        self.assertEqual(client.calls, [])
+
+    def test_cooldown_keeps_other_block_owners(self):
+        for marker in (quarantine.MARKER, quarantine.BUDGET_MARKER):
+            with self.subTest(marker=marker):
+                deployment = row("g", "long", blocked=True)
+                deployment["model_info"].update({
+                    quarantine.LIVE_FAILURE_MARKER: True,
+                    quarantine.LIVE_FAILURE_AT: "2020-01-01T00:00:00Z",
+                    marker: True,
+                })
+                client = FakeClient()
+                actions = quarantine.live_failure_sweep(client, [deployment], [], [], apply=True)
+                self.assertEqual(actions, [])
+                self.assertEqual(client.calls, [])
+                self.assertTrue(deployment["model_info"]["blocked"])
+
+    def test_short_live_sibling_cannot_replace_last_eligible_deployment(self):
+        stats = [{"model_id": "a", "model": "openai/g", "bad": 8}]
+        for has_alternative in (False, True):
+            with self.subTest(has_alternative=has_alternative):
+                rows = [row("g", "a"), row("g", "b", window=10000),
+                        row("legacy-batch", "batch")]
+                if has_alternative:
+                    rows.append(row("other", "c"))
+                actions = quarantine.live_failure_sweep(FakeClient(), rows, ["g"], stats)
+                self.assertEqual(actions[0]["action"], "blocked" if has_alternative else "kept")
+
+    def test_failed_metadata_patch_reports_failure_and_attempts_rollback(self):
+        class FailureClient(FakeClient):
+            def post(self, path, body, timeout=None):
+                super().post(path, body, timeout)
+                return {"error_status": 503} if path == "/model/unblock" and rollback_fails else {}
+
+            def patch(self, path, body):
+                super().patch(path, body)
+                return {"error_status": 500}
+
+        stats = [{"model_id": "a", "model": "openai/g", "bad": 8}]
+        for rollback_fails in (False, True):
+            with self.subTest(rollback_fails=rollback_fails):
+                rows = [row("g", "a"), row("g", "b")]
+                client = FailureClient()
+                actions = quarantine.live_failure_sweep(client, rows, ["g"], stats, apply=True)
+                self.assertEqual([call[1] for call in client.calls],
+                                 ["/model/block", "/model/a/update", "/model/unblock"])
+                self.assertEqual(actions[0]["action"], "failed")
+                self.assertEqual(actions[0]["detail"], "metadata_500;" + (
+                    "rollback_503" if rollback_fails else "block_rolled_back"
+                ))
+                self.assertEqual(rows[0]["model_info"]["blocked"], rollback_fails)
+                self.assertNotIn(quarantine.LIVE_FAILURE_MARKER, rows[0]["model_info"])
+
+    def test_spend_failure_stats_fails_closed_on_runner_error(self):
+        class Fail:
+            returncode = 1
+            stdout = ""
+
+        self.assertEqual(quarantine.spend_failure_stats(runner=lambda *a, **k: Fail()), [])
+
+
+class CliproxyRecoverySweepTest(unittest.TestCase):
+    def _cp_row(self, name, dep_id, upstream, *, blocked=True, extra_info=None):
+        info = {"id": dep_id, "mode": "chat", "blocked": blocked}
+        if extra_info:
+            info.update(extra_info)
+        return {
+            "model_name": name,
+            "litellm_params": {
+                "model": upstream,
+                "api_base": "http://192.168.68.3:8317/v1",
+                "litellm_credential_name": quarantine.CLIPROXY_CREDENTIAL,
+            },
+            "model_info": info,
+        }
+
+    def test_unblocks_recovered_cliproxy_deployments_and_deduplicates_probes(self):
+        rows = [
+            self._cp_row("claude-sonnet-5-5", "cp-1", "anthropic/claude-sonnet-5-5",
+                         extra_info={quarantine.MARKER: True}),
+            self._cp_row("claude-sonnet-5-5-high", "cp-2", "anthropic/claude-sonnet-5-5"),
+            self._cp_row("gpt-6-astra", "cp-3", "openai/gpt-6-astra"),
+        ]
+        probed = []
+
+        def fake_health(mid):
+            probed.append(mid)
+            return "ok" if mid == "cp-1" else "rate_limited"
+
+        client = FakeClient()
+        actions = quarantine.cliproxy_recovery_sweep(
+            client, rows, fake_health,
+            catalog_ids={"claude-sonnet-5-5", "gpt-6-astra"},
+            retired=set(),
+            apply=True,
+            workers=1,
+        )
+        # cp-1 and cp-2 share anthropic/claude-sonnet-5-5 -> probed once, both unblocked.
+        self.assertEqual(probed, ["cp-1", "cp-3"])
+        self.assertEqual([a["deployment"] for a in actions], ["cp-1", "cp-2"])
+        self.assertTrue(all(a["action"] == "unblocked" for a in actions))
+        self.assertFalse(rows[0]["model_info"]["blocked"])
+        self.assertFalse(rows[0]["model_info"][quarantine.MARKER])
+        self.assertFalse(rows[1]["model_info"]["blocked"])
+        self.assertTrue(rows[2]["model_info"]["blocked"])
+        unblocks = [c[2]["model_id"] for c in client.calls if c[1] == "/model/unblock"]
+        self.assertEqual(unblocks, ["cp-1", "cp-2"])
+
+    def test_respects_safety_exclusions_and_catalog_membership(self):
+        rows = [
+            self._cp_row("__advisor_helper", "cp-int", "anthropic/claude-fable-5-2"),
+            self._cp_row("claude-haiku-4-5-blocked", "cp-blk", "anthropic/claude-fable-5-2"),
+            self._cp_row("claude-opus-4-5", "cp-ret", "anthropic/claude-opus-5-5"),
+            self._cp_row("claude-fable-5-2", "cp-live", "anthropic/claude-fable-5-2",
+                         extra_info={quarantine.LIVE_FAILURE_MARKER: True}),
+            self._cp_row("claude-fable-5-1", "cp-man", "anthropic/claude-fable-5-1",
+                         extra_info={quarantine.CLIPROXY_MANUAL_BLOCK: True}),
+            self._cp_row("gpt-5.5", "cp-absent", "openai/gpt-5.5"),
+            {
+                "model_name": "gpt-6-astra",
+                "litellm_params": {"model": "openai/gpt-6-astra", "litellm_credential_name": "OpenAI-API-other"},
+                "model_info": {"id": "other-1", "mode": "chat", "blocked": True},
+            },
+        ]
+        probed = []
+        client = FakeClient()
+        actions = quarantine.cliproxy_recovery_sweep(
+            client, rows, lambda mid: (probed.append(mid), "ok")[1],
+            catalog_ids={"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5"},
+            retired={"claude-opus-4-5"},
+            apply=True,
+            workers=1,
+        )
+        self.assertEqual(probed, [])
+        self.assertEqual(actions, [])
+        self.assertEqual(client.calls, [])
+
+    def test_only_permanent_failures_back_off_and_oauth_change_resets_backoff(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            oauth = home / "oauth"
+            oauth.mkdir()
+            (oauth / "devin.json").write_text("{}")
+
+            rows = [
+                self._cp_row("gpt-6-astra", "cp-rl", "openai/gpt-6-astra"),
+                self._cp_row("deepseek-v4-pro", "cp-nf", "deepseek/devin/deepseek-v4-pro"),
+                self._cp_row("temporary", "cp-500", "openai/temporary"),
+            ]
+            probed_1 = []
+            def h1(mid):
+                probed_1.append(mid)
+                return {
+                    "cp-rl": ("rate_limited", ""),
+                    "cp-nf": ("unhealthy", "model_not_found"),
+                    "cp-500": ("unhealthy", "503 service unavailable"),
+                }[mid]
+
+            client = FakeClient()
+            quarantine.cliproxy_recovery_sweep(
+                client, rows, h1, home=home,
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro", "temporary"},
+                retired=set(), apply=True, workers=1, now=1000.0,
+            )
+            self.assertEqual(sorted(probed_1), ["cp-500", "cp-nf", "cp-rl"])
+
+            # Second run 15 min later (no oauth change): cp-nf is backed off, cp-rl IS retried!
+            probed_2 = []
+            def h2(mid):
+                probed_2.append(mid)
+                return "ok"
+            actions_2 = quarantine.cliproxy_recovery_sweep(
+                client, rows, h2, home=home,
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro", "temporary"},
+                retired=set(), apply=True, workers=1, now=1900.0,
+            )
+            self.assertEqual(probed_2, ["cp-rl", "cp-500"])
+            self.assertEqual([a["deployment"] for a in actions_2], ["cp-rl", "cp-500"])
+
+            # Adding a new credential file in oauth/ immediately clears backoff for cp-nf!
+            (oauth / "devin-new.json").write_text('{"new": true}')
+            probed_3 = []
+            actions_3 = quarantine.cliproxy_recovery_sweep(
+                client, rows, lambda mid: (probed_3.append(mid), "ok")[1], home=home,
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro", "temporary"},
+                retired=set(), apply=True, workers=1, now=2000.0,
+            )
+            self.assertEqual(probed_3, ["cp-nf"])
+            self.assertEqual([a["deployment"] for a in actions_3], ["cp-nf"])
+            self.assertFalse(rows[1]["model_info"]["blocked"])
+
+    def test_clears_stale_cliproxy_cooldown_and_reprobes_to_unblock(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rows = [
+                self._cp_row("claude-fable-5-2", "cp-claude", "anthropic/claude-fable-5-2"),
+                self._cp_row("gpt-6-astra", "cp-codex", "openai/gpt-6-astra"),
+            ]
+            reset_calls = []
+
+            def fake_reset():
+                reset_calls.append(True)
+                return "service_restart"
+
+            def fake_health(mid):
+                if not reset_calls:
+                    return ("rate_limited", "all credentials for model are cooling down")
+                if mid == "cp-claude":
+                    return ("ok", "")
+                return ("rate_limited", "usage_limit_reached: the usage limit has been reached")
+
+            client = FakeClient()
+            actions = quarantine.cliproxy_recovery_sweep(
+                client, rows, fake_health,
+                home=home,
+                catalog_ids={"claude-fable-5-2", "gpt-6-astra"},
+                retired=set(),
+                apply=True,
+                workers=1,
+                now=1000.0,
+                reset_cooldowns=fake_reset,
+                reset_min_interval=600.0,
+            )
+            self.assertEqual(len(reset_calls), 1)
+            self.assertEqual(len(actions), 1)
+            self.assertEqual(actions[0]["deployment"], "cp-claude")
+            self.assertEqual(actions[0]["reason"], "cliproxy_recovered_after_service_restart")
+            self.assertFalse(rows[0]["model_info"]["blocked"])
+            self.assertTrue(rows[1]["model_info"]["blocked"])
+
+            # Within reset_min_interval (2 min later) without oauth change: no second reset
+            quarantine.cliproxy_recovery_sweep(
+                client, rows,
+                lambda _mid: ("rate_limited", "all credentials are cooling down"),
+                home=home,
+                catalog_ids={"claude-fable-5-2", "gpt-6-astra"},
+                retired=set(),
+                apply=True,
+                workers=1,
+                now=1120.0,
+                reset_cooldowns=fake_reset,
+                reset_min_interval=600.0,
+            )
+            self.assertEqual(len(reset_calls), 1)
+
+            # After reset_min_interval (15 min later): resets and re-probes again!
+            quarantine.cliproxy_recovery_sweep(
+                client, rows,
+                lambda _mid: ("rate_limited", "all credentials are cooling down"),
+                home=home,
+                catalog_ids={"claude-fable-5-2", "gpt-6-astra"},
+                retired=set(),
+                apply=True,
+                workers=1,
+                now=1900.0,
+                reset_cooldowns=fake_reset,
+                reset_min_interval=600.0,
+            )
+            self.assertEqual(len(reset_calls), 2)
+
+    def test_preview_never_resets_cliproxy_cooldowns(self):
+        rows = [self._cp_row("claude-fable-5-2", "cp-claude", "anthropic/claude-fable-5-2")]
+        reset_calls = []
+        actions = quarantine.cliproxy_recovery_sweep(
+            FakeClient(), rows,
+            lambda _mid: ("rate_limited", "all credentials are cooling down"),
+            catalog_ids={"claude-fable-5-2"},
+            retired=set(),
+            apply=False,
+            workers=1,
+            reset_cooldowns=lambda: (reset_calls.append(True), "service_restart")[1],
+        )
+        self.assertEqual(reset_calls, [])
+        self.assertEqual(actions, [])
