@@ -268,5 +268,156 @@ class LMStudioTest(unittest.TestCase):
         self.assertEqual(body["litellm_params"]["order"], 3)
 
 
+
+class UnusedCredentialsTest(unittest.TestCase):
+    def test_unused_credential_selection_skips_dedicated_manual_and_cursor(self):
+        creds = [
+            {"credential_name": "Nvidia Nim SUB", "credential_values": {"custom_llm_provider": "NVIDIA_NIM"}},
+            {"credential_name": "lmstudio", "credential_values": {"custom_llm_provider": "lm_studio"}},
+            {"credential_name": "cursor-api", "credential_values": {"custom_llm_provider": "cursor"}},
+            {"credential_name": "OpenAI-API-blocked", "credential_values": {"custom_llm_provider": "OpenAI"}},
+            {"credential_name": "new-owned", "credential_values": {"custom_llm_provider": "OpenAI"}},
+        ]
+        rows = [
+            {
+                "model_name": "gpt-6",
+                "litellm_params": {"litellm_credential_name": "OpenAI-API-blocked"},
+                "model_info": {"blocked": True},
+            },
+            {
+                "model_name": "gpt-new",
+                "litellm_params": {"litellm_credential_name": "new-owned"},
+                "model_info": {"credential_auto_sync": extra.CREDENTIAL_OWNER},
+            },
+        ]
+        self.assertEqual(
+            extra.unused_credential_names(creds, rows),
+            ["Nvidia Nim SUB", "new-owned"],
+        )
+
+    def test_nvidia_nim_planning_uses_hosted_vllm_filters_noise_and_handles_null_order(self):
+        models = [
+            {"id": "nvidia/nemotron-3.5-bolt-e4b", "mode": "chat"},
+            {"id": "nvidia/llama-3.1-nemoguard-8b-topic-control", "mode": "chat"},
+            {"id": "fastino/gliner2-pii", "mode": "chat"},
+            {"id": "nvidia/ai-synthetic-video-detector", "mode": "chat"},
+            {"id": "nvidia/nemotron-3.5-embed-1b", "mode": "embedding"},
+        ]
+        existing = [{
+            "model_name": "nemotron-3.5-bolt-e4b",
+            "litellm_params": {"litellm_credential_name": "nvidia", "order": None},
+            "model_info": {"id": "nim-manual-1"},
+        }]
+        planned = extra.plan_credential_models(
+            "Nvidia Nim SUB", "NVIDIA_NIM", "https://integrate.api.nvidia.com/v1",
+            models, existing,
+        )
+        names = [b["model_name"] for _, b in planned]
+        self.assertEqual(names, ["nemotron-3.5-bolt-e4b", "nemotron-3.5-embed-1b"])
+        a0, b0 = planned[0]
+        self.assertEqual(a0, "create")
+        self.assertEqual(b0["litellm_params"]["model"], "hosted_vllm/nvidia/nemotron-3.5-bolt-e4b")
+        self.assertEqual(b0["litellm_params"]["custom_llm_provider"], "hosted_vllm")
+        self.assertEqual(b0["litellm_params"]["order"], 2)
+        self.assertEqual(b0["model_info"]["credential_auto_sync"], extra.CREDENTIAL_OWNER)
+
+        # Idempotent on re-run
+        existing_after = existing + [{
+            "model_name": b0["model_name"],
+            "litellm_params": dict(b0["litellm_params"]),
+            "model_info": {**b0["model_info"], "id": "nim-sub-1"},
+        }]
+        replan = extra.plan_credential_models(
+            "Nvidia Nim SUB", "NVIDIA_NIM", "https://integrate.api.nvidia.com/v1",
+            [models[0]], existing_after,
+        )
+        self.assertEqual(replan[0][0], "unchanged")
+
+    def test_dated_snapshots_are_skipped_when_base_alias_exists(self):
+        models = [
+            {"id": "gpt-5.4", "mode": "chat"},
+            {"id": "gpt-5.4-2026-03-05", "mode": "chat"},
+            {"id": "gpt-realtime-mini", "mode": "chat"},
+        ]
+        planned = extra.plan_credential_models("openai-new", "OpenAI", "", models, [])
+        self.assertEqual([b["model_name"] for _, b in planned], ["gpt-5.4"])
+
+    def test_sync_probes_and_reverts_unhealthy_with_cooldown_and_short_circuits_budget(self):
+        class CredClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.seq = 0
+
+            def get(self, path, timeout=None):
+                self.calls.append(("GET", path))
+                if path == "/credentials":
+                    return {"credentials": [
+                        {"credential_name": "sub-ok", "credential_values": {"custom_llm_provider": "NVIDIA_NIM"}},
+                        {"credential_name": "sub-broke", "credential_values": {"custom_llm_provider": "OpenAI"}},
+                    ]}
+                return super().get(path, timeout=timeout)
+
+            def post(self, path, body, timeout=None):
+                self.calls.append(("POST", path, body))
+                if path == "/model/new":
+                    self.seq += 1
+                    return {"model_id": f"dep-{self.seq}"}
+                return {"ok": True}
+
+        discovered = [
+            {
+                "credential": "sub-ok",
+                "provider": "NVIDIA_NIM",
+                "api_base": "https://integrate.api.nvidia.com/v1",
+                "models": [
+                    {"id": "nvidia/good-model", "mode": "chat"},
+                    {"id": "nvidia/bad-model", "mode": "chat"},
+                ],
+            },
+            {
+                "credential": "sub-broke",
+                "provider": "OpenAI",
+                "api_base": "https://api.openai.com/v1",
+                "models": [
+                    {"id": "gpt-a", "mode": "chat"},
+                    {"id": "gpt-b", "mode": "chat"},
+                ],
+            },
+        ]
+
+        def fake_probe(_client, model_id):
+            if model_id == "dep-1":
+                return "unhealthy"
+            if model_id == "dep-2":
+                return "ok"
+            return "budget_exceeded"
+
+        with tempfile.TemporaryDirectory() as home_str:
+            home = Path(home_str)
+            client = CredClient()
+            report = extra.sync_unused_credentials(
+                client, home, [], apply=True,
+                probe=fake_probe,
+                discover=lambda targets: [d for d in discovered if d["credential"] in targets],
+                now=1000.0,
+            )
+            self.assertEqual(report["created"], 1)
+            self.assertEqual(report["reverted"], 2)
+            # dep-1 (bad-model) and dep-3 (gpt-a, budget_exceeded) deleted; gpt-b skipped via short-circuit
+            deletes = [c[2]["id"] for c in client.calls if c[0] == "POST" and c[1] == "/model/delete"]
+            self.assertEqual(deletes, ["dep-1", "dep-3"])
+            self.assertEqual(report["credentials"]["sub-ok"]["kept_models"], ["good-model"])
+
+            # Second run within 24h skips cooled-down bad-model and sub-broke credential
+            client2 = CredClient()
+            report2 = extra.sync_unused_credentials(
+                client2, home, [], apply=False,
+                probe=fake_probe,
+                discover=lambda targets: [d for d in discovered if d["credential"] in targets],
+                now=1100.0,
+            )
+            self.assertEqual(report2["cooldown_credentials"], ["sub-broke"])
+            self.assertEqual(report2["credentials"]["sub-ok"]["models"], ["good-model"])
+
 if __name__ == "__main__":
     unittest.main()

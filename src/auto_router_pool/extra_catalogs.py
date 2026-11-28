@@ -13,14 +13,17 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from . import catalog
+from . import client as client_mod
 
 PRICE_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/"
@@ -1146,6 +1149,749 @@ def sync_lmstudio(client, home: Path, rows: list[dict], prices: dict | None = No
     return report
 
 
+
+
+# --------------------------------------------------------------------------
+# Generic unused LiteLLM credentials: discover and register usable models for
+# any credential that has no manual deployments and no dedicated syncer.
+
+CREDENTIAL_OWNER = "credential-auto-sync-v1"
+CREDENTIAL_MAX = 1024
+CREDENTIAL_PER_CAP = 32
+CREDENTIAL_RETRY_TTL_SECONDS = 86400
+DEDICATED_CREDENTIALS = frozenset({
+    "experientiallabs-shared",
+    "cliproxyapi-shared",
+    "cursor-chat-bridge",
+    "cursor-api",
+    "anthropic-api",
+    "lmstudio",
+})
+NON_CHAT_CREDENTIAL_PROVIDERS = frozenset({"cursor", "cursor-chat-bridge"})
+CHAT_ONLY_HOSTS = frozenset({"integrate.api.nvidia.com"})
+LOCAL_ZERO_COST_PROVIDERS = frozenset({"lm_studio", "ollama"})
+
+# Utility, guard, safety, audio/image/video-only, or non-chat models that
+# should not be auto-registered as general-purpose chat/embedding deployments.
+CREDENTIAL_SKIP_SUBSTRINGS = (
+    "nemoguard",
+    "safety-guard",
+    "content-safety",
+    "video-detector",
+    "gliner",
+    "nvclip",
+    "moderation",
+    "whisper",
+    "transcribe",
+    "tts",
+    "realtime",
+    "audio",
+    "image",
+    "lyria",
+    "robotics",
+    "computer-use",
+    "deep-research",
+    "nano-banana",
+    "gpt-live",
+    "calibration",
+    "riva-translate",
+    "embedqa",
+    "nemoretriever",
+    "embed-qa",
+    "rerank",
+    "starcoder2",
+    "antigravity",
+    "-search-api",
+    "-healthcare",
+    "chat-latest",
+    "flash-latest",
+    "flash-lite-latest",
+    "pro-latest",
+)
+DATED_SNAPSHOT_RE = re.compile(
+    r"-(?:\d{4}-\d{2}-\d{2}|\d{2}-\d{4}|1106|0125|0613|0301|20\d{6})$"
+)
+
+CREDENTIAL_DISCOVERY = r"""
+import base64, hashlib, json, os, urllib.error, urllib.request
+from urllib.parse import urlsplit, urlunsplit
+import psycopg, nacl.secret
+
+targets = json.loads(os.environ.get("TARGET_CREDENTIALS_JSON", "[]"))
+if not targets:
+    print("[]")
+    raise SystemExit(0)
+
+u = urlsplit(os.environ["DATABASE_URL"])
+with psycopg.connect(
+    urlunsplit((u.scheme, u.netloc, u.path, "", "")),
+    connect_timeout=5,
+    options="-c statement_timeout=5000 -c default_transaction_read_only=on",
+) as conn:
+    rows = conn.execute(
+        'SELECT credential_name, credential_values, credential_info '
+        'FROM "LiteLLM_CredentialsTable" '
+        'WHERE credential_name = ANY(%s) ORDER BY credential_name',
+        (targets,),
+    ).fetchall()
+
+salt = os.environ.get("LITELLM_SALT_KEY") or os.environ["LITELLM_MASTER_KEY"]
+box = nacl.secret.SecretBox(hashlib.sha256(salt.encode()).digest())
+
+def dec(s):
+    if not isinstance(s, str):
+        return s
+    if s.startswith("v2:gcm:"):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        b = base64.urlsafe_b64decode(s[7:])
+        return AESGCM(hashlib.sha256(salt.encode()).digest()).decrypt(b[:12], b[12:], None).decode()
+    try:
+        return box.decrypt(base64.urlsafe_b64decode(s)).decode()
+    except Exception:
+        return s
+
+results = []
+for name, raw_vals, info in rows:
+    vals = {k: dec(v) for k, v in (raw_vals or {}).items()}
+    info = info or {}
+    provider = str(vals.get("custom_llm_provider") or info.get("custom_llm_provider") or "").strip()
+    p_low = provider.lower()
+    api_base = str(vals.get("api_base") or "").strip().rstrip("/")
+    api_key = str(vals.get("api_key") or "").strip()
+    headers = {"Accept": "application/json", "User-Agent": "auto-router-pool/1.0"}
+    record = {"credential": name, "provider": provider, "api_base": api_base, "models": []}
+
+    try:
+        if p_low in ("google_ai_studio", "gemini"):
+            base = api_base or "https://generativelanguage.googleapis.com/v1beta"
+            record["api_base"] = base
+            if api_key:
+                headers["x-goog-api-key"] = api_key
+            req = urllib.request.Request(base + "/models?pageSize=200", headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.load(resp)
+            models = []
+            for item in body.get("models") or []:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("name") or "").removeprefix("models/").strip()
+                if not mid:
+                    continue
+                methods = item.get("supportedGenerationMethods") or []
+                if "generateContent" in methods:
+                    mode = "chat"
+                elif "embedContent" in methods:
+                    mode = "embedding"
+                else:
+                    continue
+                entry = {"id": mid, "mode": mode}
+                if isinstance(item.get("inputTokenLimit"), int) and item["inputTokenLimit"] > 0:
+                    entry["max_input_tokens"] = item["inputTokenLimit"]
+                if isinstance(item.get("outputTokenLimit"), int) and item["outputTokenLimit"] > 0:
+                    entry["max_output_tokens"] = item["outputTokenLimit"]
+                models.append(entry)
+            record["models"] = models
+        elif p_low == "anthropic":
+            base = api_base or "https://api.anthropic.com"
+            record["api_base"] = base
+            headers["anthropic-version"] = "2023-06-01"
+            if api_key:
+                headers["x-api-key"] = api_key
+            req = urllib.request.Request(base + "/v1/models?limit=100", headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.load(resp)
+            models = []
+            for item in body.get("data") or []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                if item.get("lifecycle") and item.get("lifecycle") != "active":
+                    continue
+                entry = {"id": str(item["id"]).strip(), "mode": "chat"}
+                if isinstance(item.get("max_input_tokens"), int) and item["max_input_tokens"] > 0:
+                    entry["max_input_tokens"] = item["max_input_tokens"]
+                if isinstance(item.get("max_tokens"), int) and item["max_tokens"] > 0:
+                    entry["max_output_tokens"] = item["max_tokens"]
+                models.append(entry)
+            record["models"] = models
+        elif p_low in ("nvidia_nim", "openrouter", "openai", "lm_studio", "ollama", "hosted_vllm", "vllm"):
+            if p_low == "nvidia_nim":
+                base = api_base or "https://integrate.api.nvidia.com/v1"
+            elif p_low == "openrouter":
+                base = api_base or "https://openrouter.ai/api/v1"
+            elif p_low == "openai":
+                base = api_base or "https://api.openai.com/v1"
+            else:
+                base = api_base
+            if not base:
+                record["error"] = "missing_api_base"
+                results.append(record)
+                continue
+            record["api_base"] = base
+            if api_key:
+                headers["Authorization"] = "Bearer " + api_key
+            if p_low == "lm_studio":
+                root = base[:-3] if base.endswith("/v1") else base
+                urls = [root + "/api/v0/models", base + "/models"]
+            elif base.endswith("/v1"):
+                urls = [base + "/models"]
+            else:
+                urls = [base + "/v1/models", base + "/models"]
+            data = None
+            last_err = None
+            for url in urls:
+                try:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        page = json.load(resp)
+                    items = page.get("data") if isinstance(page, dict) else None
+                    if isinstance(items, list):
+                        data = items
+                        break
+                except urllib.error.HTTPError as exc:
+                    body_txt = ""
+                    try:
+                        body_txt = exc.read().decode("utf-8", "ignore")[:180]
+                    except Exception:
+                        pass
+                    last_err = f"http_{exc.code}: {body_txt}"
+                except Exception as exc:
+                    last_err = f"{type(exc).__name__}: {str(exc)[:160]}"
+            if data is None:
+                record["error"] = last_err or "discovery_failed"
+            else:
+                models = []
+                for item in data:
+                    if not isinstance(item, dict) or not item.get("id"):
+                        continue
+                    mid = str(item["id"]).strip()
+                    raw_type = str(item.get("type") or "").lower()
+                    if raw_type in ("embeddings", "embedding") or "embed" in mid.lower():
+                        mode = "embedding"
+                    else:
+                        mode = "chat"
+                    entry = {"id": mid, "mode": mode}
+                    ctx = item.get("max_context_length") or item.get("context_length")
+                    if isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0:
+                        entry["max_input_tokens"] = ctx
+                    if isinstance(item.get("pricing"), dict):
+                        entry["pricing"] = item["pricing"]
+                    if isinstance(item.get("capabilities"), list):
+                        entry["capabilities"] = item["capabilities"]
+                    models.append(entry)
+                record["models"] = models
+        else:
+            record["error"] = f"unsupported_provider:{provider}"
+    except urllib.error.HTTPError as exc:
+        body_txt = ""
+        try:
+            body_txt = exc.read().decode("utf-8", "ignore")[:180]
+        except Exception:
+            pass
+        record["error"] = f"http_{exc.code}: {body_txt}"
+    except Exception as exc:
+        record["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+    results.append(record)
+
+print(json.dumps(results))
+"""
+
+
+def unused_credential_names(
+    credentials: list[dict],
+    rows: list[dict],
+    skip: set[str] | frozenset[str] = DEDICATED_CREDENTIALS,
+) -> list[str]:
+    """Return credentials with no manual deployments and no dedicated syncer.
+
+    A credential whose only deployments are already owned by ``CREDENTIAL_OWNER``
+    stays eligible so subsequent hourly syncs remain idempotent and pick up new
+    models. Credentials with any non-owned deployment (including manually
+    blocked routes) are never touched, so operator blocks are always respected.
+    """
+    manual_creds: set[str] = set()
+    for row in rows:
+        params = row.get("litellm_params") or {}
+        info = row.get("model_info") or {}
+        cname = params.get("litellm_credential_name")
+        if not isinstance(cname, str) or not cname:
+            continue
+        if info.get("credential_auto_sync") == CREDENTIAL_OWNER:
+            continue
+        manual_creds.add(cname)
+
+    eligible: list[str] = []
+    for cred in credentials:
+        if not isinstance(cred, dict):
+            continue
+        name = str(cred.get("credential_name") or "").strip()
+        if not name or name in skip or name in manual_creds:
+            continue
+        vals = cred.get("credential_values") or {}
+        info = cred.get("credential_info") or {}
+        provider = str(
+            vals.get("custom_llm_provider") or info.get("custom_llm_provider") or ""
+        ).strip().lower()
+        if provider in NON_CHAT_CREDENTIAL_PROVIDERS:
+            continue
+        eligible.append(name)
+    return sorted(set(eligible))
+
+
+def discover_credentials(target_names: list[str]) -> list[dict]:
+    """Discover catalogs for target credentials inside the LiteLLM container."""
+    if not target_names:
+        return []
+    completed = subprocess.run(
+        [
+            "docker", "exec", "-i",
+            "-e", f"TARGET_CREDENTIALS_JSON={json.dumps(target_names)}",
+            litellm_container(), "python", "-",
+        ],
+        input=CREDENTIAL_DISCOVERY,
+        text=True,
+        capture_output=True,
+        timeout=90,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip()[:160]
+        raise RuntimeError(
+            f"credential catalog discovery failed with status {completed.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    payload = json.loads(completed.stdout)
+    if not isinstance(payload, list):
+        raise ValueError("credential catalog discovery response is malformed")
+    return payload
+
+
+def credential_transport(provider: str, api_base: str = "") -> tuple[str, str, str | None]:
+    """Return ``(model_prefix, custom_llm_provider, effective_api_base)``."""
+    p_low = (provider or "").strip().lower()
+    base = (api_base or "").strip().rstrip("/")
+    host = (urllib.parse.urlparse(base).hostname or "").casefold()
+    if p_low == "nvidia_nim" or host in CHAT_ONLY_HOSTS:
+        return "hosted_vllm", "hosted_vllm", base or "https://integrate.api.nvidia.com/v1"
+    if p_low in ("google_ai_studio", "gemini"):
+        return "gemini", "gemini", base or None
+    if p_low == "openrouter":
+        return "openrouter", "openrouter", None
+    if p_low == "anthropic":
+        return "anthropic", "anthropic", base or ANTHROPIC_API
+    if p_low == "lm_studio":
+        return "lm_studio", "lm_studio", base or None
+    if p_low == "ollama":
+        return "ollama", "ollama", base or None
+    if p_low in ("hosted_vllm", "vllm"):
+        return "hosted_vllm", "hosted_vllm", base or None
+    return "openai", "openai", base or None
+
+
+def credential_model_eligible(
+    upstream_id: str,
+    mode: str,
+    retired: set[str],
+    all_ids: set[str],
+    provider: str = "",
+) -> bool:
+    """Filter out retired, utility/guard/media-only, and redundant dated models."""
+    low = upstream_id.strip().lower()
+    if not low or low.endswith(":batch"):
+        return False
+    tail = low.rsplit("/", 1)[-1].split(":", 1)[0]
+    if upstream_id in retired or tail in retired:
+        return False
+    if any(token in low for token in CREDENTIAL_SKIP_SUBSTRINGS):
+        return False
+    if provider.strip().lower() == "openrouter" and ":free" not in low:
+        return False
+    if mode not in ("chat", "embedding"):
+        return False
+    # Skip dated snapshots when the undated alias is advertised alongside them.
+    match = DATED_SNAPSHOT_RE.search(low)
+    if match:
+        base_id = low[: match.start()]
+        if base_id in {item.lower() for item in all_ids}:
+            return False
+    return True
+
+
+def _finite_cost(value) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num) or num < 0:
+        return None
+    return num
+
+
+def _lookup_credential_price(
+    upstream_id: str,
+    public: str,
+    prefix: str,
+    provider: str,
+    catalog_pricing: dict | None,
+    prices: dict,
+) -> tuple[str | None, dict[str, float], dict]:
+    """Return ``(base_model, cost_fields, extra_limits)`` for a discovered model."""
+    p_low = (provider or "").strip().lower()
+    if p_low in LOCAL_ZERO_COST_PROVIDERS or upstream_id.lower().endswith(":free"):
+        return None, {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0}, {}
+
+    if isinstance(catalog_pricing, dict):
+        inp = _finite_cost(catalog_pricing.get("prompt"))
+        out = _finite_cost(catalog_pricing.get("completion"))
+        if inp is not None and out is not None:
+            return None, {"input_cost_per_token": inp, "output_cost_per_token": out}, {}
+
+    tail = upstream_id.rsplit("/", 1)[-1].split(":", 1)[0]
+    for candidate in (
+        f"{prefix}/{upstream_id}",
+        f"{p_low}/{upstream_id}" if p_low else "",
+        f"openrouter/{upstream_id}",
+        upstream_id,
+        public,
+        tail,
+    ):
+        if not candidate:
+            continue
+        entry = prices.get(candidate)
+        if not isinstance(entry, dict):
+            continue
+        costs: dict[str, float] = {}
+        for field in ("input_cost_per_token", "output_cost_per_token"):
+            val = _finite_cost(entry.get(field))
+            if val is not None:
+                costs[field] = val
+        limits: dict[str, int] = {}
+        for field in ("max_input_tokens", "max_output_tokens"):
+            val = entry.get(field)
+            if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                limits[field] = val
+        if costs:
+            return candidate, costs, limits
+    return None, {}, {}
+
+
+def plan_credential_models(
+    credential: str,
+    provider: str,
+    api_base: str,
+    models: list[dict],
+    existing: list[dict],
+    prices: dict | None = None,
+    retired: set[str] | None = None,
+    skip_ids: set[str] | None = None,
+    max_per_credential: int = CREDENTIAL_PER_CAP,
+) -> list[tuple[str, dict]]:
+    """Plan LiteLLM deployments for eligible models discovered on a credential."""
+    if not isinstance(existing, list) or len(existing) > CREDENTIAL_MAX:
+        raise ValueError("invalid registry or registry exceeds its ceiling")
+    prices = prices or {}
+    retired = retired or set()
+    skip_ids = skip_ids or set()
+    prefix, custom_provider, effective_base = credential_transport(provider, api_base)
+
+    all_ids = {
+        str(m.get("id") or "").strip()
+        for m in models
+        if isinstance(m, dict) and isinstance(m.get("id"), str) and m.get("id").strip()
+    }
+
+    candidates: list[dict] = []
+    seen_ids: set[str] = set()
+    tail_counts: dict[str, int] = {}
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        uid = str(model.get("id") or "").strip()
+        if not uid or uid in seen_ids or uid in skip_ids:
+            continue
+        mode = str(model.get("mode") or "chat").lower()
+        if not credential_model_eligible(uid, mode, retired, all_ids, provider=provider):
+            continue
+        seen_ids.add(uid)
+        tail = uid.rsplit("/", 1)[-1].split(":", 1)[0]
+        tail_counts[tail] = tail_counts.get(tail, 0) + 1
+        candidates.append({**model, "id": uid, "mode": mode})
+
+    # Prefer chat models ahead of embeddings, sorted deterministically, bounded by cap.
+    candidates.sort(key=lambda item: (0 if item["mode"] == "chat" else 1, item["id"]))
+    candidates = candidates[:max_per_credential]
+    colliding_tails = {t for t, count in tail_counts.items() if count > 1}
+
+    planned: list[tuple[str, dict]] = []
+    creates = 0
+    for model in candidates:
+        uid = model["id"]
+        mode = model["mode"]
+        tail = uid.rsplit("/", 1)[-1].split(":", 1)[0]
+        public = uid.split(":", 1)[0].replace("/", "-") if tail in colliding_tails else tail
+
+        same = [row for row in existing if row.get("model_name") == public]
+        owned = [
+            row for row in same
+            if row.get("litellm_params", {}).get("litellm_credential_name") == credential
+            and row.get("model_info", {}).get("credential_auto_sync") == CREDENTIAL_OWNER
+        ]
+        manual = [
+            row for row in same
+            if row.get("litellm_params", {}).get("litellm_credential_name") == credential
+            and row not in owned
+        ]
+        if manual and not owned:
+            continue
+        if len(owned) > 1:
+            raise ValueError(f"ambiguous auto-synced route for {credential}/{uid}")
+        previous = owned[0] if owned else None
+        if previous and previous["model_info"].get("credential_auto_sync_model_id") != uid:
+            raise ValueError(f"owned route identity mismatch for {credential}/{uid}")
+
+        orders = []
+        for row in same:
+            if row is previous:
+                continue
+            raw_order = row.get("litellm_params", {}).get("order")
+            order = 1 if raw_order is None else raw_order
+            if isinstance(order, bool) or not isinstance(order, int):
+                raise ValueError("invalid routing order for " + public)
+            orders.append(order)
+        prev_order = previous["litellm_params"].get("order") if previous else None
+        order = prev_order if isinstance(prev_order, int) and not isinstance(prev_order, bool) else (
+            (max(orders) if orders else 0) + 1
+        )
+
+        base_model, costs, price_limits = _lookup_credential_price(
+            uid, public, prefix, provider, model.get("pricing"), prices,
+        )
+        info = dict(previous["model_info"]) if previous else {}
+        info.update({
+            "mode": mode,
+            "credential_auto_sync": CREDENTIAL_OWNER,
+            "credential_auto_sync_source": credential,
+            "credential_auto_sync_model_id": uid,
+        })
+        if base_model and not info.get("base_model"):
+            info["base_model"] = base_model
+        for field in ("max_input_tokens", "max_output_tokens"):
+            val = model.get(field) or price_limits.get(field)
+            if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                info[field] = val
+        caps = model.get("capabilities") or []
+        if isinstance(caps, list) and "tool_use" in caps:
+            info["supports_function_calling"] = True
+
+        params_raw = {
+            "model": f"{prefix}/{uid}",
+            "custom_llm_provider": custom_provider,
+            "litellm_credential_name": credential,
+            "order": order,
+            **costs,
+        }
+        if effective_base and custom_provider not in ("openrouter", "gemini"):
+            params_raw["api_base"] = effective_base
+        params = catalog.prompt_cache_drop(params_raw)
+        if any(params.get(field) for field in ("api_key", "headers", "extra_headers")):
+            raise ValueError("credential route contains a static credential for " + uid)
+
+        body = {"model_name": public, "litellm_params": params, "model_info": info}
+        if previous:
+            same_fields = all(
+                previous[section].get(key) == value
+                for section in ("litellm_params", "model_info")
+                for key, value in body[section].items()
+            )
+            action = "unchanged" if same_fields else "update"
+        else:
+            action = "create"
+            creates += 1
+        planned.append((action, body))
+
+    if len(existing) + creates > CREDENTIAL_MAX:
+        raise ValueError("registry ceiling would be exceeded")
+    return planned
+
+
+def _probe_new_deployment(client, model_id: str, probe_fn=None) -> str:
+    """Verify a newly registered deployment answers; retry once on replica lag."""
+    fn = probe_fn or client_mod.deployment_health
+    status = fn(client, model_id)
+    if status == "unknown" and probe_fn is None:
+        time.sleep(1.5)
+        status = fn(client, model_id)
+    return status
+
+
+def sync_unused_credentials(
+    client,
+    home: Path,
+    rows: list[dict],
+    prices: dict | None = None,
+    apply: bool = False,
+    probe=None,
+    discover=None,
+    now: float | None = None,
+) -> dict:
+    """Discover and register usable models for unused LiteLLM credentials."""
+    prices = prices or {}
+    now_ts = time.time() if now is None else float(now)
+    creds_resp = client.get("/credentials")
+    if creds_resp.get("error_status") is not None:
+        raise RuntimeError(f"gateway refused /credentials: status {creds_resp['error_status']}")
+    credentials = creds_resp.get("credentials") or []
+    targets = unused_credential_names(credentials, rows)
+
+    state_path = home / "unused-credentials-sync-state.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    failed_models: dict[str, dict] = dict(state.get("failed_models") or {})
+    failed_creds: dict[str, dict] = dict(state.get("failed_credentials") or {})
+
+    # Prune expired cooldown entries.
+    failed_models = {
+        k: v for k, v in failed_models.items()
+        if isinstance(v, dict) and now_ts - float(v.get("ts") or 0) < CREDENTIAL_RETRY_TTL_SECONDS
+    }
+    failed_creds = {
+        k: v for k, v in failed_creds.items()
+        if isinstance(v, dict) and now_ts - float(v.get("ts") or 0) < CREDENTIAL_RETRY_TTL_SECONDS
+    }
+
+    active_targets = [c for c in targets if c not in failed_creds]
+    discovered = (discover or discover_credentials)(active_targets) if active_targets else []
+    retired = retired_names(home)
+
+    all_preview: list[dict] = []
+    per_credential: dict[str, dict] = {}
+    working_rows = list(rows)
+    total_created = total_updated = total_reverted = 0
+
+    for item in discovered:
+        cred_name = str(item.get("credential") or "")
+        provider = str(item.get("provider") or "")
+        api_base = str(item.get("api_base") or "")
+        if item.get("error"):
+            per_credential[cred_name] = {"provider": provider, "error": item["error"]}
+            continue
+        models = item.get("models") or []
+        skip_ids = {
+            k.split("::", 1)[1]
+            for k in failed_models
+            if k.startswith(cred_name + "::")
+        }
+        try:
+            planned = plan_credential_models(
+                cred_name, provider, api_base, models, working_rows,
+                prices=prices, retired=retired, skip_ids=skip_ids,
+            )
+        except ValueError as exc:
+            per_credential[cred_name] = {"provider": provider, "error": str(exc)}
+            continue
+
+        all_preview.extend(
+            {"credential": cred_name, "action": action, **body}
+            for action, body in planned
+        )
+        summary = {
+            "provider": provider,
+            "api_base": api_base,
+            "catalog_models": len(models),
+            "skipped_cooldown": len(skip_ids),
+            "planned": {
+                action: sum(a == action for a, _ in planned)
+                for action in ("create", "update", "unchanged")
+            },
+            "models": [body["model_name"] for _, body in planned],
+        }
+
+        if apply:
+            created = updated = reverted = 0
+            kept_models: list[str] = []
+            reverted_models: list[dict] = []
+            for action, body in planned:
+                uid = body["model_info"]["credential_auto_sync_model_id"]
+                mode = body["model_info"].get("mode", "chat")
+                if action == "create":
+                    res = client.post("/model/new", body)
+                    if res.get("error_status") is not None:
+                        reverted += 1
+                        reverted_models.append({
+                            "model": body["model_name"], "id": uid,
+                            "reason": f"create_{res['error_status']}",
+                        })
+                        continue
+                    model_id = res.get("model_id") or (res.get("model_info") or {}).get("id")
+                    if mode == "chat" and model_id:
+                        health = _probe_new_deployment(client, model_id, probe_fn=probe)
+                        if health == "budget_exceeded":
+                            client.post("/model/delete", {"id": model_id})
+                            reverted += 1
+                            reverted_models.append({
+                                "model": body["model_name"], "id": uid, "reason": "budget_exceeded",
+                            })
+                            failed_creds[cred_name] = {"ts": now_ts, "reason": "budget_exceeded"}
+                            break
+                        if health not in ("ok", "rate_limited"):
+                            client.post("/model/delete", {"id": model_id})
+                            reverted += 1
+                            reverted_models.append({
+                                "model": body["model_name"], "id": uid, "reason": health,
+                            })
+                            failed_models[f"{cred_name}::{uid}"] = {"ts": now_ts, "reason": health}
+                            continue
+                    created += 1
+                    kept_models.append(body["model_name"])
+                    working_rows.append({
+                        "model_name": body["model_name"],
+                        "litellm_params": dict(body["litellm_params"]),
+                        "model_info": {**body["model_info"], "id": model_id},
+                    })
+                elif action == "update":
+                    identifier = body["model_info"]["id"]
+                    res = client.patch(
+                        f"/model/{urllib.parse.quote(identifier, safe='')}/update", body
+                    )
+                    if res.get("error_status") is not None:
+                        raise RuntimeError(
+                            f"gateway refused credential update for {body['model_name']}: "
+                            f"status {res['error_status']}"
+                        )
+                    updated += 1
+            summary.update({
+                "created": created,
+                "updated": updated,
+                "reverted": reverted,
+                "kept_models": kept_models,
+                "reverted_models": reverted_models,
+            })
+            total_created += created
+            total_updated += updated
+            total_reverted += reverted
+
+        per_credential[cred_name] = summary
+
+    report = {
+        "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "eligible_credentials": targets,
+        "cooldown_credentials": sorted(c for c in targets if c in failed_creds),
+        "credentials": per_credential,
+        "no_models_removed": True,
+    }
+    if apply:
+        report["created"] = total_created
+        report["updated"] = total_updated
+        report["reverted"] = total_reverted
+        atomic(state_path, {
+            "updated_at": report["checked_at"],
+            "failed_models": failed_models,
+            "failed_credentials": failed_creds,
+        })
+    atomic(home / "unused-credentials-sync-preview.json", all_preview)
+    atomic(home / "unused-credentials-sync-report.json", report)
+    return report
+
+
 def sync_all(client, home: Path, rows: list[dict], prices: dict | None = None,
              apply: bool = False) -> dict:
     """Run every provider catalogue, keeping one failure from hiding the rest."""
@@ -1157,6 +1903,7 @@ def sync_all(client, home: Path, rows: list[dict], prices: dict | None = None,
         ("anthropic", lambda: sync_anthropic(client, home, rows, prices, apply)),
         ("argon", lambda: sync_argon(client, home, rows, apply)),
         ("lmstudio", lambda: sync_lmstudio(client, home, rows, prices, apply)),
+        ("unused_credentials", lambda: sync_unused_credentials(client, home, rows, prices, apply)),
     ):
         try:
             output[name] = call()
