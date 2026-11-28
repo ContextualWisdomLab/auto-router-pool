@@ -1,7 +1,9 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from auto_router_pool import extra_catalogs as extra
 
@@ -234,10 +236,66 @@ class LMStudioTest(unittest.TestCase):
         self.assertEqual(b1["litellm_params"]["output_cost_per_token"], 0.0)
 
     def test_colliding_tails_are_disambiguated_without_slash(self):
-        models = [{"id": "org-a/shared-model"}, {"id": "org-b/shared-model"}]
+        models = [
+            {"id": "org-a/shared-model", "type": "llm"},
+            {"id": "org-b/shared-model", "type": "llm"},
+        ]
         planned = extra.plan_lmstudio(models, [], "http://172.21.0.1:12340/v1")
         names = [body["model_name"] for _, body in planned]
         self.assertEqual(names, ["org-a-shared-model", "org-b-shared-model"])
+
+    def test_discovery_timeout_preserves_other_provider_results(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.multiple(
+            extra, sync_cursor_cloud=mock.DEFAULT, sync_cursor_chat=mock.DEFAULT,
+            sync_anthropic=mock.DEFAULT, sync_argon=mock.DEFAULT,
+            litellm_container=mock.DEFAULT,
+        ) as mocks, mock.patch.object(
+            extra.subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 60)
+        ):
+            mocks["sync_argon"].return_value = {"action": "unchanged"}
+            result = extra.sync_all(FakeClient(), Path(home), [])
+        self.assertEqual(result["argon"], {"action": "unchanged"})
+        self.assertEqual(result["lmstudio"], {"error": "RuntimeError: LM Studio catalog discovery timed out"})
+
+    def test_transformed_names_avoid_registry_and_plan_collisions(self):
+        models = [
+            {"id": identifier, "type": "llm"}
+            for identifier in ("a/b-c/m", "a-b/c/m", "a-b-c-m")
+        ]
+        existing = [{"model_name": "a-b-c-m", "litellm_params": {}, "model_info": {}}]
+        planned = extra.plan_lmstudio(models, existing, "http://example.test/v1")
+        names = {body["model_name"] for _, body in planned}
+        self.assertEqual(len(names), 3)
+        self.assertNotIn("a-b-c-m", {body["model_name"] for _, body in planned[:2]})
+        self.assertTrue(all("/" not in name for name in names))
+
+    def test_owned_name_survives_catalog_changes_and_duplicates_fail_closed(self):
+        api_base = "http://example.test/v1"
+        models = [{"id": f"{org}/shared", "type": "llm"} for org in ("a", "b")]
+        _, first = extra.plan_lmstudio(models[:1], [], api_base)[0]
+        first["model_info"]["id"] = "existing"
+        planned = extra.plan_lmstudio(models, [first], api_base)
+        self.assertEqual([(action, body["model_name"]) for action, body in planned],
+                         [("unchanged", "shared"), ("create", "b-shared")])
+        duplicate = {**first, "model_name": "a-shared"}
+        with self.assertRaisesRegex(ValueError, "ambiguous LM Studio route"):
+            extra.plan_lmstudio(models, [first, duplicate], api_base)
+
+    def test_model_type_takes_precedence_and_unknown_models_are_skipped(self):
+        models = [
+            {"id": "embed-chat", "type": "llm"},
+            {"id": "embed-vision", "type": "vlm"},
+            {"id": "no_name_hint", "type": "embedding"},
+            {"id": "embed-fallback"},
+            {"id": "bge-small"},
+            {"id": "embed-unknown", "type": "other"},
+        ]
+        planned = extra.plan_lmstudio(models, [], "http://example.test/v1")
+        self.assertEqual(
+            {body["model_name"]: body["model_info"]["mode"] for _, body in planned},
+            {"embed-chat": "chat", "embed-vision": "chat",
+             "no_name_hint": "embedding", "embed-fallback": "embedding"},
+        )
 
     def test_manual_route_is_preserved_and_owned_route_is_idempotent(self):
         manual_rows = [{
@@ -247,6 +305,10 @@ class LMStudioTest(unittest.TestCase):
         }]
         planned = extra.plan_lmstudio([self.MODELS[0]], manual_rows, "http://172.21.0.1:12340/v1")
         self.assertEqual(planned, [])
+
+        manual_rows[0]["litellm_params"]["model"] = "lm_studio/another/gemma-4-e4b"
+        planned = extra.plan_lmstudio([self.MODELS[0]], manual_rows, "http://example.test/v1")
+        self.assertEqual(planned[0][1]["model_name"], "google-gemma-4-e4b")
 
         created = extra.plan_lmstudio([self.MODELS[0]], [], "http://172.21.0.1:12340/v1")[0][1]
         existing = [{

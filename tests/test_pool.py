@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from auto_router_pool import pool
 
@@ -48,6 +49,14 @@ class FingerprintTest(unittest.TestCase):
             pool.fingerprint(self.rows(False), ["model-primary"]),
             pool.fingerprint(self.rows(True), ["model-primary"]),
         )
+
+    def test_context_floor_change_invalidates_watch_fingerprint(self):
+        rows, names = self.rows(False), ["model-primary"]
+        previous = pool.fingerprint(rows, names)
+        with mock.patch.object(pool, "MIN_INPUT_TOKENS", pool.MIN_INPUT_TOKENS + 1):
+            current = pool.fingerprint(rows, names)
+            self.assertNotEqual(current, previous)
+            self.assertEqual(current, pool.fingerprint(rows, names))
 
     def test_catalogue_change_changes_fingerprint(self):
         self.assertNotEqual(

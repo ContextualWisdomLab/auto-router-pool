@@ -280,6 +280,16 @@ class PriceSyncPassTest(unittest.TestCase):
             {"input_cost_per_token": 2.5e-07, "output_cost_per_token": 2e-06},
         )
 
+    def test_price_backfill_preserves_explicit_benchmark_aliases(self):
+        for alias in ("aa_base_model", "benchmark_base"):
+            with self.subTest(alias=alias):
+                deployment = row("seed-1.6", "c1", model="openai/seed-1.6")
+                deployment["model_info"][alias] = "operator-alias"
+                client = FakeClient()
+                changes = maintenance.price_sync_pass(client, [deployment], self.PRICES, apply=True)
+                self.assertEqual(changes[0]["action"], "updated")
+                self.assertNotIn("model_info", client.calls[0][2])
+
     def test_preview_writes_nothing(self):
         rows = [row("seed-1.6", "c1", model="openai/seed-1.6")]
         client = FakeClient()

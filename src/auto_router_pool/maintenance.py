@@ -366,7 +366,9 @@ def price_sync_pass(client, rows: list[dict], prices: dict | None = None,
             continue
 
         patch_body: dict = {"litellm_params": dict(costs)}
-        if matched_key and not info.get("base_model"):
+        if matched_key and not any(
+            info.get(key) for key in ("base_model", "aa_base_model", "benchmark_base")
+        ):
             patch_body["model_info"] = {"base_model": matched_key}
 
         if apply:

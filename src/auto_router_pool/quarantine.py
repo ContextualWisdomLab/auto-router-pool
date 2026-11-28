@@ -101,17 +101,20 @@ def budget_sweep(client, rows: list[dict], health, apply: bool = False) -> list[
                 if not info.get(BUDGET_MARKER):
                     continue
                 deployment = info["id"]
+                still_blocked = any(info.get(marker) for marker in (MARKER, LIVE_FAILURE_MARKER))
                 if apply:
-                    client.post("/model/unblock", {"model_id": deployment})
+                    if not still_blocked:
+                        client.post("/model/unblock", {"model_id": deployment})
                     client.patch(
                         f"/model/{deployment}/update",
                         {"model_info": {BUDGET_MARKER: False}},
                     )
-                info["blocked"] = False
+                info["blocked"] = still_blocked
                 info[BUDGET_MARKER] = False
                 actions.append({
                     "model": row["model_name"], "deployment": deployment,
-                    "action": "unblocked", "reason": "budget_recovered",
+                    "action": "cleared" if still_blocked else "unblocked",
+                    "reason": "budget_recovered",
                 })
     return actions
 
@@ -130,7 +133,14 @@ def sweep(client, rows: list[dict], names, probe, apply: bool = False) -> list[d
             continue
         # Read the declared window, not the block flags: a group this sweep
         # blocked itself has to stay eligible, or nothing can ever lift the block.
-        if input_window(rows, name) < MIN_INPUT_TOKENS:
+        active_window = input_window(group, name)
+        recovery_window = input_window(group, name, include_blocked=True)
+        has_recoverable_block = any(
+            (row.get("model_info") or {}).get(MARKER) for row in group
+        )
+        if active_window < MIN_INPUT_TOKENS and (
+            not has_recoverable_block or recovery_window < MIN_INPUT_TOKENS
+        ):
             actions.append(
                 {"model": name, "action": "skipped", "reason": "context_below_floor"}
             )
@@ -146,16 +156,26 @@ def sweep(client, rows: list[dict], names, probe, apply: bool = False) -> list[d
                 info = row.get("model_info") or {}
                 if not info.get(MARKER):
                     continue
+                still_blocked = any(info.get(marker) for marker in (BUDGET_MARKER, LIVE_FAILURE_MARKER))
                 if apply:
-                    client.post("/model/unblock", {"model_id": info["id"]})
+                    if not still_blocked:
+                        client.post("/model/unblock", {"model_id": info["id"]})
                     client.patch(
                         f"/model/{info['id']}/update",
                         {"model_info": {MARKER: False}},
                     )
-                info["blocked"] = False
-                actions.append(
-                    {"model": name, "deployment": info["id"], "action": "unblocked"}
-                )
+                info[MARKER] = False
+                info["blocked"] = still_blocked
+                actions.append({
+                    "model": name, "deployment": info["id"],
+                    "action": "cleared" if still_blocked else "unblocked",
+                })
+            continue
+
+        if active_window < MIN_INPUT_TOKENS:
+            actions.append(
+                {"model": name, "action": "skipped", "reason": "context_below_floor"}
+            )
             continue
 
         if len(live) < 2:
@@ -208,10 +228,7 @@ sql = (
     "    AND COALESCE(metadata->'error_information'->>'error_message', '') NOT ILIKE '%%maximum context length%%'"
     ") AS bad "
     'FROM "LiteLLM_SpendLogs" '
-    'WHERE "startTime" >= ('
-    '  SELECT MAX("startTime") - make_interval(mins => %s) '
-    '  FROM "LiteLLM_SpendLogs"'
-    ') '
+    'WHERE "startTime" >= CURRENT_TIMESTAMP - make_interval(mins => %s) '
     "  AND model_id IS NOT NULL AND model_id <> '' "
     "  AND call_type IN ('anthropic_messages', 'acompletion', 'aresponses') "
     "  AND NOT ("
@@ -280,14 +297,15 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 def _eligible_live_models(rows: list[dict]) -> set[str]:
-    names = {
-        row["model_name"]
+    eligible = [
+        row
         for row in rows
         if not (row.get("model_info") or {}).get("blocked")
         and str((row.get("model_info") or {}).get("mode") or "chat") in ("chat", "completion")
         and not str(row.get("model_name") or "").startswith(("__", "auto"))
-    }
-    return {name for name in names if input_window(rows, name) >= MIN_INPUT_TOKENS}
+    ]
+    names = {row["model_name"] for row in eligible}
+    return {name for name in names if input_window(eligible, name) >= MIN_INPUT_TOKENS}
 
 
 def live_failure_sweep(
@@ -323,7 +341,10 @@ def live_failure_sweep(
     # Step 1: lift only our own live-failure blocks after the retry cooldown.
     for row in rows:
         info = row.get("model_info") or {}
-        if not info.get("blocked") or not info.get(LIVE_FAILURE_MARKER):
+        if (
+            not info.get("blocked") or not info.get(LIVE_FAILURE_MARKER)
+            or info.get(BUDGET_MARKER) or info.get(MARKER)
+        ):
             continue
         blocked_at = _parse_iso(info.get(LIVE_FAILURE_AT))
         if blocked_at is None:
@@ -397,22 +418,15 @@ def live_failure_sweep(
             continue
 
         # Never empty the entire eligible chat pool.
-        live_siblings = [
-            other for other in rows
-            if other["model_name"] == name
-            and not (other.get("model_info") or {}).get("blocked")
-            and (other.get("model_info") or {}).get("id") != deployment
-        ]
-        if not live_siblings:
-            remaining = _eligible_live_models(rows) - {name}
-            if not remaining:
-                actions.append({
-                    "model": name,
-                    "deployment": deployment,
-                    "action": "kept",
-                    "reason": f"{breach};last_eligible_model",
-                })
-                continue
+        remaining = _eligible_live_models([other for other in rows if other is not row])
+        if not remaining:
+            actions.append({
+                "model": name,
+                "deployment": deployment,
+                "action": "kept",
+                "reason": f"{breach};last_eligible_model",
+            })
+            continue
 
         if apply:
             result = client.post("/model/block", {"model_id": deployment})
@@ -424,7 +438,7 @@ def live_failure_sweep(
                     "detail": f"block_{result['error_status']}",
                 })
                 continue
-            client.patch(
+            metadata = client.patch(
                 f"/model/{deployment}/update",
                 {
                     "model_info": {
@@ -434,6 +448,20 @@ def live_failure_sweep(
                     }
                 },
             )
+            if metadata.get("error_status") is not None:
+                rollback = client.post("/model/unblock", {"model_id": deployment})
+                rollback_error = rollback.get("error_status")
+                info["blocked"] = rollback_error is not None
+                actions.append({
+                    "model": name,
+                    "deployment": deployment,
+                    "action": "failed",
+                    "detail": f"metadata_{metadata['error_status']};" + (
+                        "block_rolled_back" if rollback_error is None
+                        else f"rollback_{rollback_error}"
+                    ),
+                })
+                continue
         info["blocked"] = True
         info[LIVE_FAILURE_MARKER] = True
         info[LIVE_FAILURE_AT] = now_iso

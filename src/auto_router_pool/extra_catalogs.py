@@ -950,14 +950,17 @@ print(json.dumps({"api_base": base, "models": data}))
 
 def lmstudio_catalog(credential: str = LMSTUDIO_CREDENTIAL) -> tuple[str, list[dict]]:
     """Query LM Studio through the gateway container using its stored credential."""
-    completed = subprocess.run(
-        [
-            "docker", "exec", "-i",
-            "-e", f"LMSTUDIO_CREDENTIAL={credential}",
-            litellm_container(), "python", "-",
-        ],
-        input=LMSTUDIO_DISCOVERY, text=True, capture_output=True, timeout=60,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "docker", "exec", "-i",
+                "-e", f"LMSTUDIO_CREDENTIAL={credential}",
+                litellm_container(), "python", "-",
+            ],
+            input=LMSTUDIO_DISCOVERY, text=True, capture_output=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("LM Studio catalog discovery timed out") from error
     if completed.returncode != 0:
         detail = (completed.stderr or "").strip()[:160]
         raise RuntimeError(
@@ -983,7 +986,7 @@ def lmstudio_public_name(upstream_id: str, colliding_tails: set[str]) -> str:
 def plan_lmstudio(models: list[dict], existing: list[dict], api_base: str,
                   prices: dict | None = None,
                   credential: str = LMSTUDIO_CREDENTIAL) -> list[tuple[str, dict]]:
-    """Plan LiteLLM deployments for every model currently advertised by LM Studio."""
+    """Plan deployments for advertised models whose serving mode can be determined."""
     if not isinstance(existing, list) or len(existing) > LMSTUDIO_MAX:
         raise ValueError("invalid registry or registry exceeds its ceiling")
     if not isinstance(api_base, str) or not api_base.strip():
@@ -1009,26 +1012,69 @@ def plan_lmstudio(models: list[dict], existing: list[dict], api_base: str,
         valid_models.append({**model, "id": identifier})
 
     colliding_tails = {tail for tail, count in tail_counts.items() if count > 1}
+    by_name: dict[str, list[dict]] = {}
+    owned_by_id: dict[str, list[dict]] = {}
+    for row in existing:
+        by_name.setdefault(row["model_name"], []).append(row)
+        info = row.get("model_info") or {}
+        upstream_id = info.get("lmstudio_model_id")
+        if info.get("lmstudio_sync") == LMSTUDIO_OWNER and isinstance(upstream_id, str):
+            owned_by_id.setdefault(upstream_id, []).append(row)
+
     planned, creates = [], 0
+    allocated: set[str] = set()
     for model in valid_models:
         upstream_id = model["id"]
-        public = lmstudio_public_name(upstream_id, colliding_tails)
-        same = [row for row in existing if row.get("model_name") == public]
-        owned = [
-            row for row in same
-            if row.get("model_info", {}).get("lmstudio_sync") == LMSTUDIO_OWNER
-            and row.get("model_info", {}).get("lmstudio_model_id") == upstream_id
-        ]
-        manual = [
-            row for row in same
-            if row.get("litellm_params", {}).get("litellm_credential_name") == credential
-            and row not in owned
-        ]
+        owned = owned_by_id.get(upstream_id, [])
         if len(owned) > 1:
-            raise ValueError("ambiguous LM Studio route for " + public)
-        if manual and not owned:
-            continue  # Never adopt or overwrite a manually configured LM Studio route.
+            # Keep the registry intact; an operator must resolve ambiguous ownership.
+            raise ValueError("ambiguous LM Studio route for " + upstream_id)
         previous = owned[0] if owned else None
+
+        raw_type = str(model.get("type") or "").strip().lower()
+        if raw_type in ("embedding", "embeddings"):
+            mode = "embedding"
+        elif raw_type in ("llm", "vlm"):
+            mode = "chat"
+        elif not raw_type and "embed" in upstream_id.lower():
+            mode = "embedding"
+        else:
+            # The OpenAI-compatible listing can omit type. Leave unknown routes alone.
+            continue
+        is_embedding = mode == "embedding"
+
+        if previous:
+            public = previous["model_name"]
+        else:
+            preferred = lmstudio_public_name(upstream_id, colliding_tails)
+            occupants = by_name.get(preferred, [])
+            collision = preferred in allocated or any(
+                (row.get("model_info") or {}).get("lmstudio_sync") == LMSTUDIO_OWNER
+                for row in occupants
+            )
+            manual = [
+                row["litellm_params"].get("model")
+                for row in occupants
+                if (row.get("litellm_params") or {}).get("litellm_credential_name") == credential
+                and (row.get("model_info") or {}).get("lmstudio_sync") != LMSTUDIO_OWNER
+            ]
+            if any(
+                not isinstance(route, str) or not route.startswith("lm_studio/")
+                or route == "lm_studio/" + upstream_id
+                for route in manual
+            ):
+                continue  # Never adopt or duplicate a manually configured route.
+            collision = collision or bool(manual)
+            public = preferred
+            # The plain tail may deliberately join another provider's group.
+            if collision or (occupants and preferred != upstream_id.rsplit("/", 1)[-1]):
+                public = upstream_id.replace("/", "-")
+                stem, suffix = public, 2
+                while public in by_name or public in allocated:
+                    public = f"{stem}-{suffix}"
+                    suffix += 1
+            allocated.add(public)
+        same = by_name.get(public, [])
 
         orders = []
         for row in same:
@@ -1041,10 +1087,6 @@ def plan_lmstudio(models: list[dict], existing: list[dict], api_base: str,
         order = previous["litellm_params"].get("order") if previous else (max(orders) if orders else 0) + 1
         if isinstance(order, bool) or not isinstance(order, int) or order < 1:
             order = (max(orders) if orders else 0) + 1
-
-        raw_type = str(model.get("type") or "").lower()
-        is_embedding = raw_type in ("embeddings", "embedding") or "embed" in upstream_id.lower()
-        mode = "embedding" if is_embedding else "chat"
 
         info = dict(previous["model_info"]) if previous else {}
         info.update({

@@ -15,7 +15,7 @@ def fingerprint(rows: list[dict], names: list[str]) -> str:
         (row["model_name"], bool((row.get("model_info") or {}).get("blocked")))
         for row in rows
     )
-    payload = json.dumps([ROUTING_POLICY_VERSION, sorted(names), blocked]).encode()
+    payload = json.dumps([ROUTING_POLICY_VERSION, MIN_INPUT_TOKENS, sorted(names), blocked]).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -41,15 +41,15 @@ def changed_scores(hashes: dict[str, str], previous: dict[str, str]) -> list[str
 MIN_INPUT_TOKENS = 200_000
 
 
-def input_window(rows: list[dict], name: str) -> int:
+def input_window(rows: list[dict], name: str, *, include_blocked: bool = False) -> int:
     """Largest declared input window among usable deployments in a group.
 
     When every deployment in the group is blocked, falls back to all
-    deployments so quarantine recovery can still judge eligibility.
+    deployments. Quarantine recovery can explicitly include blocked deployments.
     """
     group = [row for row in rows if row["model_name"] == name]
     active = [row for row in group if not (row.get("model_info") or {}).get("blocked")]
-    pool_rows = active or group
+    pool_rows = group if include_blocked else (active or group)
     values = [
         (row.get("model_info") or {}).get("max_input_tokens")
         for row in pool_rows

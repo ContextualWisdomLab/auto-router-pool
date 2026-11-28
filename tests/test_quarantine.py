@@ -144,6 +144,12 @@ class SweepTest(unittest.TestCase):
         self.assertIn(("POST", "/model/unblock", {"model_id": "a"}), client.calls)
         self.assertNotIn(("POST", "/model/unblock", {"model_id": "b"}), client.calls)
 
+    def test_recovery_considers_blocked_context_when_live_sibling_is_too_small(self):
+        rows = [row("g", "long", blocked=True, marked=True), row("g", "short", window=10000)]
+        client = FakeClient()
+        actions = quarantine.sweep(client, rows, ["g"], lambda name: (True, "ok"), apply=True)
+        self.assertEqual(actions, [{"model": "g", "deployment": "long", "action": "unblocked"}])
+
     def test_a_preview_run_writes_nothing(self):
         rows = [row("g", "a"), row("g", "b")]
         client = FakeClient()
@@ -313,6 +319,56 @@ class LiveFailureSweepTest(unittest.TestCase):
         actions = quarantine.live_failure_sweep(client, rows, ["glm-5.3-flash"], stats, apply=False)
         self.assertEqual(actions[0]["action"], "blocked")
         self.assertEqual(client.calls, [])
+
+    def test_cooldown_keeps_other_block_owners(self):
+        for marker in (quarantine.MARKER, quarantine.BUDGET_MARKER):
+            with self.subTest(marker=marker):
+                deployment = row("g", "long", blocked=True)
+                deployment["model_info"].update({
+                    quarantine.LIVE_FAILURE_MARKER: True,
+                    quarantine.LIVE_FAILURE_AT: "2020-01-01T00:00:00Z",
+                    marker: True,
+                })
+                client = FakeClient()
+                actions = quarantine.live_failure_sweep(client, [deployment], [], [], apply=True)
+                self.assertEqual(actions, [])
+                self.assertEqual(client.calls, [])
+                self.assertTrue(deployment["model_info"]["blocked"])
+
+    def test_short_live_sibling_cannot_replace_last_eligible_deployment(self):
+        stats = [{"model_id": "a", "model": "openai/g", "bad": 8}]
+        for has_alternative in (False, True):
+            with self.subTest(has_alternative=has_alternative):
+                rows = [row("g", "a"), row("g", "b", window=10000)]
+                if has_alternative:
+                    rows.append(row("other", "c"))
+                actions = quarantine.live_failure_sweep(FakeClient(), rows, ["g"], stats)
+                self.assertEqual(actions[0]["action"], "blocked" if has_alternative else "kept")
+
+    def test_failed_metadata_patch_reports_failure_and_attempts_rollback(self):
+        class FailureClient(FakeClient):
+            def post(self, path, body, timeout=None):
+                super().post(path, body, timeout)
+                return {"error_status": 503} if path == "/model/unblock" and rollback_fails else {}
+
+            def patch(self, path, body):
+                super().patch(path, body)
+                return {"error_status": 500}
+
+        stats = [{"model_id": "a", "model": "openai/g", "bad": 8}]
+        for rollback_fails in (False, True):
+            with self.subTest(rollback_fails=rollback_fails):
+                rows = [row("g", "a"), row("g", "b")]
+                client = FailureClient()
+                actions = quarantine.live_failure_sweep(client, rows, ["g"], stats, apply=True)
+                self.assertEqual([call[1] for call in client.calls],
+                                 ["/model/block", "/model/a/update", "/model/unblock"])
+                self.assertEqual(actions[0]["action"], "failed")
+                self.assertEqual(actions[0]["detail"], "metadata_500;" + (
+                    "rollback_503" if rollback_fails else "block_rolled_back"
+                ))
+                self.assertEqual(rows[0]["model_info"]["blocked"], rollback_fails)
+                self.assertNotIn(quarantine.LIVE_FAILURE_MARKER, rows[0]["model_info"])
 
     def test_spend_failure_stats_fails_closed_on_runner_error(self):
         class Fail:

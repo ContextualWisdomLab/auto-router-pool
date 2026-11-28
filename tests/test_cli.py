@@ -104,6 +104,38 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(cli.required_env(cli.Settings(key="")), ["LITELLM_MASTER_KEY"])
 
 
+class MaintenanceTest(unittest.TestCase):
+    def test_price_lookup_uses_repaired_upstream_only_after_successful_patch(self):
+        for status in ({}, {"error_status": 503}):
+            with self.subTest(status=status), TemporaryDirectory() as home:
+                model = "example/known"
+                stale = [{
+                    "model_name": "alias",
+                    "litellm_params": {"model": model + "-high"},
+                    "model_info": {"id": "dep"},
+                }]
+                fresh = [{**stale[0], "litellm_params": {"model": model}}]
+                client = mock.Mock()
+                client.get.side_effect = [{"data": stale}, {"data": fresh}]
+                client.patch.return_value = status
+                settings = cli.Settings(home=Path(home), key="test")
+                catalog = settings.home / "litellm-model-prices-main.json"
+                catalog.write_text(json.dumps({model: {"input_cost_per_token": 0.001}}))
+                with mock.patch.object(cli.Settings, "from_env", return_value=settings), \
+                        mock.patch.object(cli, "Client", return_value=client), \
+                        redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(cli.run(cli.parse_args(["--maintenance", "--apply"])), 0)
+                result = json.loads(out.getvalue())
+                if status:
+                    self.assertEqual(result["effort_suffix"][0]["action"], "failed")
+                    self.assertEqual(result["price_sync"], [])
+                    self.assertEqual(client.get.call_count, 1)
+                else:
+                    self.assertEqual(result["effort_suffix"][0]["action"], "updated")
+                    self.assertEqual(result["price_sync"][0]["price_key"], model)
+                    self.assertEqual(client.get.call_count, 2)
+
+
 class SelectedModelsTest(unittest.TestCase):
     def test_collects_models_from_every_managed_router(self):
         rows = [

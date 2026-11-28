@@ -424,6 +424,10 @@ def run(args) -> int:
             output["chat_only_transport"] = chat_only_transport_pass(
                 litellm, rows, apply=args.apply
             )
+            if args.apply and any(
+                change["action"] == "updated" for change in output["effort_suffix"]
+            ):
+                rows = models(litellm)
             output["price_sync"] = price_sync_pass(
                 litellm, rows, prices, apply=args.apply
             )
