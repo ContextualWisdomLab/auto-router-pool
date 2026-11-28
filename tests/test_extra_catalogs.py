@@ -481,5 +481,36 @@ class UnusedCredentialsTest(unittest.TestCase):
             self.assertEqual(report2["cooldown_credentials"], ["sub-broke"])
             self.assertEqual(report2["credentials"]["sub-ok"]["models"], ["good-model"])
 
+    def test_skips_model_already_blocked_on_same_host_without_live_sibling(self):
+        models = [
+            {"id": "z-ai/glm-5.3-flash", "mode": "chat"},
+            {"id": "nvidia/nemotron-3.5-bolt-e4b", "mode": "chat"},
+        ]
+        existing = [
+            {
+                "model_name": "glm-5.3-flash",
+                "litellm_params": {
+                    "model": "hosted_vllm/z-ai/glm-5.3-flash",
+                    "api_base": "https://integrate.api.nvidia.com/v1",
+                    "litellm_credential_name": "nvidia",
+                },
+                "model_info": {"id": "nim-glm-blocked", "blocked": True},
+            },
+            {
+                "model_name": "nemotron-3.5-bolt-e4b",
+                "litellm_params": {
+                    "model": "hosted_vllm/nvidia/nemotron-3.5-bolt-e4b",
+                    "api_base": "https://integrate.api.nvidia.com/v1",
+                    "litellm_credential_name": "nvidia",
+                },
+                "model_info": {"id": "nim-bolt-live", "blocked": False},
+            },
+        ]
+        planned = extra.plan_credential_models(
+            "Nvidia Nim SUB", "NVIDIA_NIM", "https://integrate.api.nvidia.com/v1",
+            models, existing,
+        )
+        self.assertEqual([b["model_name"] for _, b in planned], ["nemotron-3.5-bolt-e4b"])
+
 if __name__ == "__main__":
     unittest.main()

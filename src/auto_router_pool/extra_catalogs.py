@@ -1664,6 +1664,30 @@ def plan_credential_models(
     candidates = candidates[:max_per_credential]
     colliding_tails = {t for t, count in tail_counts.items() if count > 1}
 
+    # Never re-introduce an upstream model on the same host when every existing
+    # deployment for that exact (host, upstream_id) is already blocked (for
+    # example, a provider-side broken streaming model manually blocked on a
+    # sibling key on integrate.api.nvidia.com).
+    eff_host = (urllib.parse.urlparse(effective_base or "").hostname or "").casefold()
+    host_blocked: set[tuple[str, str]] = set()
+    host_live: set[tuple[str, str]] = set()
+    for row in existing:
+        rp = row.get("litellm_params") or {}
+        ri = row.get("model_info") or {}
+        if rp.get("litellm_credential_name") == credential:
+            continue
+        rhost = (urllib.parse.urlparse(str(rp.get("api_base") or "")).hostname or "").casefold()
+        rmodel = str(rp.get("model") or "").strip()
+        ruid = rmodel.split("/", 1)[-1] if "/" in rmodel else rmodel
+        if not rhost or not ruid:
+            continue
+        key = (rhost, ruid.casefold())
+        if ri.get("blocked"):
+            host_blocked.add(key)
+        else:
+            host_live.add(key)
+    blocked_only_on_host = host_blocked - host_live
+
     planned: list[tuple[str, dict]] = []
     creates = 0
     for model in candidates:
@@ -1684,6 +1708,8 @@ def plan_credential_models(
             and row not in owned
         ]
         if manual and not owned:
+            continue
+        if not owned and eff_host and (eff_host, uid.casefold()) in blocked_only_on_host:
             continue
         if len(owned) > 1:
             raise ValueError(f"ambiguous auto-synced route for {credential}/{uid}")
