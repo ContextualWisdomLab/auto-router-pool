@@ -74,7 +74,7 @@ from .pool import (
     free_models,
 )
 from .quarantine import (
-    MARKER as QUARANTINE_MARKER,
+    TRIAGE_MARKER,
     budget_sweep,
     cliproxy_recovery_sweep,
     live_failure_sweep,
@@ -257,13 +257,13 @@ def triage_deployments(litellm, rows, name, *, apply=False):
         if hasattr(litellm, "patch"):
             litellm.patch(
                 f"/model/{model_id}/update",
-                {"model_info": {QUARANTINE_MARKER: True}},
+                {"model_info": {TRIAGE_MARKER: True}},
             )
         for row in rows:
             info = row.get("model_info") or {}
             if info.get("id") == model_id:
                 info["blocked"] = True
-                info[QUARANTINE_MARKER] = True
+                info[TRIAGE_MARKER] = True
         blocked.append(model_id)
     return blocked, "blocked"
 
@@ -565,6 +565,7 @@ def run(args) -> int:
         quarantine = quarantine_sweep(
             litellm, rows, managed,
             lambda name: probe(litellm, name), apply=args.apply,
+            health=lambda model_id: deployment_health(litellm, model_id),
         )
         if quarantine and args.apply:
             rows = models(litellm)

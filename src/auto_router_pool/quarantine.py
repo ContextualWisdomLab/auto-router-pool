@@ -15,6 +15,7 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
+import re
 from pathlib import Path
 import subprocess
 import time
@@ -28,9 +29,10 @@ from .extra_catalogs import (
     litellm_container,
     retired_names,
 )
-from .pool import MIN_INPUT_TOKENS, input_window
+from .pool import MIN_INPUT_TOKENS, batch_models, input_window
 
 MARKER = "auto_pool_quarantined"
+TRIAGE_MARKER = "auto_pool_triage_blocked"
 BUDGET_MARKER = "auto_pool_budget_blocked"
 LIVE_FAILURE_MARKER = "auto_pool_live_failure_blocked"
 LIVE_FAILURE_AT = "auto_pool_live_failure_at"
@@ -112,7 +114,9 @@ def budget_sweep(client, rows: list[dict], health, apply: bool = False) -> list[
                 if not info.get(BUDGET_MARKER):
                     continue
                 deployment = info["id"]
-                still_blocked = any(info.get(marker) for marker in (MARKER, LIVE_FAILURE_MARKER))
+                still_blocked = any(info.get(marker) for marker in (
+                    MARKER, TRIAGE_MARKER, LIVE_FAILURE_MARKER, CLIPROXY_MANUAL_BLOCK,
+                ))
                 if apply:
                     if not still_blocked:
                         client.post("/model/unblock", {"model_id": deployment})
@@ -130,18 +134,44 @@ def budget_sweep(client, rows: list[dict], health, apply: bool = False) -> list[
     return actions
 
 
-def sweep(client, rows: list[dict], names, probe, apply: bool = False) -> list[dict]:
+def sweep(client, rows: list[dict], names, probe, apply: bool = False, *, health=None) -> list[dict]:
     """Probe every named group and align its block flags with the answer.
 
     ``probe(name)`` returns ``(ok, reason)``. A failing group keeps its last live
     deployment: blocking every deployment would remove the group from routing
     instead of narrowing it, which is a worse outcome than one failing call.
+    Triage blocks require an independent successful ``health(deployment_id)``.
     """
     actions: list[dict] = []
     for name in sorted(set(names)):
         group = [row for row in rows if row["model_name"] == name]
         if not group:
             continue
+        for row in group:
+            info = row.get("model_info") or {}
+            deployment = info.get("id")
+            if not (info.get(TRIAGE_MARKER) and deployment and health):
+                continue
+            if health(deployment) != "ok":
+                continue
+            still_blocked = any(info.get(marker) for marker in (
+                MARKER, BUDGET_MARKER, LIVE_FAILURE_MARKER, CLIPROXY_MANUAL_BLOCK,
+            ))
+            if apply:
+                if not still_blocked:
+                    result = client.post("/model/unblock", {"model_id": deployment})
+                    if result.get("error_status") is not None:
+                        continue
+                client.patch(
+                    f"/model/{deployment}/update",
+                    {"model_info": {TRIAGE_MARKER: False}},
+                )
+            info[TRIAGE_MARKER] = False
+            info["blocked"] = still_blocked
+            actions.append({
+                "model": name, "deployment": deployment,
+                "action": "cleared" if still_blocked else "unblocked",
+            })
         # Read the declared window, not the block flags: a group this sweep
         # blocked itself has to stay eligible, or nothing can ever lift the block.
         active_window = input_window(group, name)
@@ -167,7 +197,9 @@ def sweep(client, rows: list[dict], names, probe, apply: bool = False) -> list[d
                 info = row.get("model_info") or {}
                 if not info.get(MARKER):
                     continue
-                still_blocked = any(info.get(marker) for marker in (BUDGET_MARKER, LIVE_FAILURE_MARKER))
+                still_blocked = any(info.get(marker) for marker in (
+                    BUDGET_MARKER, TRIAGE_MARKER, LIVE_FAILURE_MARKER, CLIPROXY_MANUAL_BLOCK,
+                ))
                 if apply:
                     if not still_blocked:
                         client.post("/model/unblock", {"model_id": info["id"]})
@@ -315,7 +347,7 @@ def _eligible_live_models(rows: list[dict]) -> set[str]:
         and str((row.get("model_info") or {}).get("mode") or "chat") in ("chat", "completion")
         and not str(row.get("model_name") or "").startswith(("__", "auto"))
     ]
-    names = {row["model_name"] for row in eligible}
+    names = {row["model_name"] for row in eligible} - set(batch_models(rows))
     return {name for name in names if input_window(eligible, name) >= MIN_INPUT_TOKENS}
 
 
@@ -354,7 +386,9 @@ def live_failure_sweep(
         info = row.get("model_info") or {}
         if (
             not info.get("blocked") or not info.get(LIVE_FAILURE_MARKER)
-            or info.get(BUDGET_MARKER) or info.get(MARKER)
+            or any(info.get(marker) for marker in (
+                BUDGET_MARKER, MARKER, TRIAGE_MARKER, CLIPROXY_MANUAL_BLOCK,
+            ))
         ):
             continue
         blocked_at = _parse_iso(info.get(LIVE_FAILURE_AT))
@@ -734,6 +768,7 @@ def cliproxy_recovery_sweep(
     backoff = {
         k: v for k, v in backoff.items()
         if isinstance(v, dict)
+        and v.get("verdict") == "permanent"
         and now_ts - float(v.get("ts") or 0) < CLIPROXY_UNAVAILABLE_RETRY_SECONDS
     }
 
@@ -798,7 +833,7 @@ def cliproxy_recovery_sweep(
 
     actions: list[dict] = []
     for key in ordered_keys:
-        verdict, _detail = probed[key]
+        verdict, detail = probed[key]
         model_str, api_base = key
         state_key = f"{model_str}@{api_base}"
         if verdict == "ok":
@@ -806,6 +841,12 @@ def cliproxy_recovery_sweep(
             for row in groups[key]:
                 info = row.get("model_info") or {}
                 deployment = info["id"]
+                if (
+                    info.get(TRIAGE_MARKER)
+                    and row is not groups[key][0]
+                    and _parse_health(health(deployment))[0] != "ok"
+                ):
+                    continue
                 if apply:
                     res = client.post("/model/unblock", {"model_id": deployment})
                     if res.get("error_status") is not None:
@@ -818,20 +859,18 @@ def cliproxy_recovery_sweep(
                         })
                         continue
                     clear_fields = {}
-                    if info.get(MARKER):
-                        clear_fields[MARKER] = False
-                    if info.get(BUDGET_MARKER):
-                        clear_fields[BUDGET_MARKER] = False
+                    for marker in (MARKER, TRIAGE_MARKER, BUDGET_MARKER):
+                        if info.get(marker):
+                            clear_fields[marker] = False
                     if clear_fields:
                         client.patch(
                             f"/model/{deployment}/update",
                             {"model_info": clear_fields},
                         )
                 info["blocked"] = False
-                if info.get(MARKER):
-                    info[MARKER] = False
-                if info.get(BUDGET_MARKER):
-                    info[BUDGET_MARKER] = False
+                for marker in (MARKER, TRIAGE_MARKER, BUDGET_MARKER):
+                    if info.get(marker):
+                        info[marker] = False
                 reason = (
                     f"cliproxy_recovered_after_{reset_method}"
                     if reset_method and key in cooldown_keys
@@ -844,11 +883,11 @@ def cliproxy_recovery_sweep(
                     "action": "unblocked" if apply else "would_unblock",
                     "reason": reason,
                 })
-        elif verdict == "unhealthy":
-            # Permanent account/model errors (e.g. not_found) back off for 6h;
-            # rate_limited / cooldown / unknown are NOT backed off so quota resets
-            # are caught on the next sync.
-            backoff[state_key] = {"ts": now_ts, "verdict": verdict}
+        elif verdict == "unhealthy" and re.search(
+            r"\b(?:not_found|model_not_found|account_not_found)\b", detail
+        ):
+            # Only explicit unavailable model/account errors warrant a long delay.
+            backoff[state_key] = {"ts": now_ts, "verdict": "permanent"}
 
     if state_path and apply:
         atomic(state_path, {

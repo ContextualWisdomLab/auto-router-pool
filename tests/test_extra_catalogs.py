@@ -1,4 +1,10 @@
+import contextlib
+import io
 import json
+import os
+import sys
+import types
+import urllib.error
 import subprocess
 import tempfile
 import unittest
@@ -306,6 +312,10 @@ class LMStudioTest(unittest.TestCase):
         planned = extra.plan_lmstudio([self.MODELS[0]], manual_rows, "http://172.21.0.1:12340/v1")
         self.assertEqual(planned, [])
 
+        manual_rows[0]["model_name"] = "operator-alias"
+        manual_rows[0]["litellm_params"]["model"] = "lm_studio/" + self.MODELS[0]["id"]
+        self.assertEqual(extra.plan_lmstudio([self.MODELS[0]], manual_rows, "http://example.test/v1"), [])
+        manual_rows[0]["model_name"] = "gemma-4-e4b"
         manual_rows[0]["litellm_params"]["model"] = "lm_studio/another/gemma-4-e4b"
         planned = extra.plan_lmstudio([self.MODELS[0]], manual_rows, "http://example.test/v1")
         self.assertEqual(planned[0][1]["model_name"], "google-gemma-4-e4b")
@@ -331,7 +341,175 @@ class LMStudioTest(unittest.TestCase):
 
 
 
+class ContainerDiscoveryTest(unittest.TestCase):
+    def test_embedded_discovery_refuses_redirects_and_keeps_direct_responses(self):
+        vals = {"api_base": "https://catalog.example.test/v1", "api_key": "fixture-token",
+                "custom_llm_provider": "lm_studio"}
+        gemini = {"custom_llm_provider": "gemini"}
+        scripts = (
+            (extra.LMSTUDIO_DISCOVERY, [(vals,)]),
+            (extra.CREDENTIAL_DISCOVERY, [("local", vals, {}), ("google", gemini, {})]),
+        )
+
+        for script, db_rows in scripts:
+            with self.subTest(dedicated=len(db_rows) == 1):
+                psycopg = types.ModuleType("psycopg")
+                psycopg.connect = mock.MagicMock()
+                psycopg.connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = db_rows
+                nacl = types.ModuleType("nacl")
+                nacl.secret = types.ModuleType("nacl.secret")
+                nacl.secret.SecretBox = mock.Mock()
+                nacl.secret.SecretBox.return_value.decrypt.side_effect = ValueError
+                response_body = mock.Mock()
+                error = lambda req: urllib.error.HTTPError(req.full_url, 302, "redirect", {}, response_body)
+
+                def open_request(req, **kwargs):
+                    if req.full_url.endswith("/v1/models"):
+                        return io.StringIO(json.dumps({"data": [
+                            {"id": "embed-chat", "type": "llm"},
+                            {"id": "vec", "type": "embeddings"},
+                            {"id": "embed-auto"},
+                        ]}))
+                    raise error(req)
+
+                def build_opener(handler):
+                    self.assertIsNone(handler.redirect_request(
+                        None, None, 302, "redirect", {}, "https://other.example.test/",
+                    ))
+                    return types.SimpleNamespace(open=open_request)
+
+                stdout = io.StringIO()
+                with mock.patch.dict(sys.modules, {"psycopg": psycopg, "nacl": nacl, "nacl.secret": nacl.secret}), mock.patch.dict(
+                    os.environ, {"DATABASE_URL": "postgresql://example.test/db",
+                                 "LITELLM_SALT_KEY": "fixture",
+                                 "TARGET_CREDENTIALS_JSON": '["local", "google"]'},
+                ), mock.patch.object(extra.urllib.request, "build_opener", side_effect=build_opener), contextlib.redirect_stdout(stdout):
+                    exec(script, {})
+                response_body.read.assert_not_called()
+                result = json.loads(stdout.getvalue())
+                if len(db_rows) == 1:
+                    self.assertEqual(len(result["models"]), 3)
+                else:
+                    self.assertEqual([item["mode"] for item in result[0]["models"]],
+                                     ["chat", "embedding", "embedding"])
+                    self.assertEqual(result[1]["error"], "http_302: gemini")
+
+
 class UnusedCredentialsTest(unittest.TestCase):
+    def test_collisions_and_catalog_changes_preserve_owned_names(self):
+        plan = extra.plan_credential_models
+        models = [{"id": uid} for uid in ("a/x", "b/x", "a-x")]
+        first = plan("cred", "openai", "", models, [])
+        names = {body["model_name"] for _, body in first}
+        self.assertEqual(names, {"a-x", "a-x-2", "b-x"})
+
+        existing = []
+        for idx, (_, body) in enumerate(first):
+            body["model_info"]["id"] = f"dep-{idx}"
+            existing.append(body)
+        existing[1]["model_name"] = "operator-public-name"
+        result = plan("cred", "openai", "", [models[0]], existing)
+        self.assertEqual(result[0][0], "unchanged")
+        self.assertEqual(result[0][1]["model_name"], "operator-public-name")
+
+        result = plan("cred", "openai", "", [{"id": "new/a-x"}], existing)
+        self.assertEqual(result[0][0], "create")
+        self.assertNotIn(result[0][1]["model_name"], names)
+
+    def test_openrouter_free_filter_and_provider_price_matching(self):
+        plan = extra.plan_credential_models
+        rows = plan("cred", "openrouter", "", [{"id": "org/model:free"},
+                                                 {"id": "org/model:free-preview"}], [])
+        self.assertEqual([body["litellm_params"]["model"] for _, body in rows],
+                         ["openrouter/org/model:free"])
+
+        prices = {
+            "openai/org/model": {**PRICE, "litellm_provider": "openrouter"},
+            "openrouter/org/model": {**PRICE, "litellm_provider": "openrouter"},
+        }
+        _, body = plan("cred", "openai", "", [{"id": "org/model"}], [], prices)[0]
+        self.assertNotIn("base_model", body["model_info"])
+        self.assertNotIn("input_cost_per_token", body["litellm_params"])
+        prices["org/model"] = {**PRICE, "litellm_provider": "openai"}
+        _, body = plan("cred", "openai", "", [{"id": "org/model"}], [], prices)[0]
+        self.assertEqual(body["model_info"]["base_model"], "org/model")
+        self.assertEqual(body["litellm_params"]["input_cost_per_token"], 2e-6)
+
+    def test_sync_all_checks_fresh_registry_and_reports_discovery_timeout(self):
+        client = FakeClient()
+        client.get = mock.Mock(side_effect=lambda path: {
+            "/model/info": {"data": client.info},
+            "/credentials": {"credentials": [{"credential_name": "new"}]},
+        }[path])
+
+        def sync_lmstudio(*args):
+            client.info.append({"model_name": "created-local"})
+            return {"created": 1}
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.multiple(
+            extra, sync_cursor_cloud=mock.DEFAULT, sync_cursor_chat=mock.DEFAULT,
+            sync_anthropic=mock.DEFAULT, sync_argon=mock.DEFAULT, CREDENTIAL_MAX=1,
+            sync_lmstudio=mock.Mock(side_effect=sync_lmstudio), litellm_container=mock.DEFAULT,
+        ):
+            with mock.patch.object(
+                extra.subprocess, "run", side_effect=subprocess.TimeoutExpired("docker", 90),
+            ):
+                result = extra.sync_all(client, Path(home), [], apply=True)
+            self.assertEqual(result["lmstudio"], {"created": 1})
+            self.assertEqual(result["unused_credentials"],
+                             {"error": "RuntimeError: credential catalog discovery timed out"})
+
+            client.info.clear()
+            with mock.patch.object(extra, "discover_credentials", return_value=[
+                {"credential": "new", "provider": "openai", "models": [{"id": "example"}]},
+            ]):
+                result = extra.sync_all(client, Path(home), [], apply=True)
+            summary = result["unused_credentials"]
+            self.assertEqual(summary["credentials"]["new"]["error"],
+                             "registry ceiling would be exceeded")
+            self.assertEqual(summary["created"], 0)
+
+    def test_failed_deletes_are_retried_and_cooldown_survives_later_errors(self):
+        for health in ("unhealthy", "budget_exceeded"):
+            with self.subTest(health=health), tempfile.TemporaryDirectory() as home_str:
+                home = Path(home_str)
+                client = FakeClient()
+                client.get = mock.Mock(return_value={"credentials": [{"credential_name": "new"}]})
+                client.post = mock.Mock(side_effect=[{"model_id": "dep"}, {"error_status": 503}, {}])
+                discover = lambda _: [{"credential": "new", "provider": "openai",
+                                      "models": [{"id": "bad"}]}]
+                first = extra.sync_unused_credentials(
+                    client, home, [], apply=True, discover=discover,
+                    probe=lambda *_: health, now=1000,
+                )
+                self.assertEqual(first["reverted"], 0)
+                self.assertEqual(first["pending_cleanup"]["dep"]["error_status"], 503)
+                state_path = home / "unused-credentials-sync-state.json"
+                snapshot = state_path.read_text()
+                extra.sync_unused_credentials(client, home, [], discover=discover, now=1001)
+                self.assertEqual(state_path.read_text(), snapshot)
+
+                second = extra.sync_unused_credentials(
+                    client, home, [], apply=True, discover=discover, now=1002,
+                )
+                self.assertEqual(second["reverted"], 1)
+                self.assertEqual(second["pending_cleanup"], {})
+                self.assertEqual(client.post.call_args_list[-2:],
+                                 [mock.call("/model/delete", {"id": "dep"})] * 2)
+
+        with tempfile.TemporaryDirectory() as home_str:
+            home = Path(home_str)
+            client = FakeClient()
+            client.get = mock.Mock(return_value={"credentials": [{"credential_name": "new"}]})
+            client.post = mock.Mock(side_effect=[{"model_id": "bad"}, {}, OSError("later create")])
+            with self.assertRaisesRegex(OSError, "later create"):
+                extra.sync_unused_credentials(
+                    client, home, [], apply=True, probe=lambda *_: "unhealthy",
+                    discover=lambda _: [{"credential": "new", "models": [{"id": "a"}, {"id": "b"}]}],
+                )
+            saved = json.loads((home / "unused-credentials-sync-state.json").read_text())
+            self.assertEqual(saved["failed_models"]["new::a"]["reason"], "unhealthy")
+
     def test_unused_credential_selection_skips_dedicated_manual_and_cursor(self):
         creds = [
             {"credential_name": "Nvidia Nim SUB", "credential_values": {"custom_llm_provider": "NVIDIA_NIM"}},

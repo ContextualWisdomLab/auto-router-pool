@@ -102,6 +102,18 @@ class BudgetSweepTest(unittest.TestCase):
             [{"model_id": "1"}],
         )
 
+    def test_budget_recovery_preserves_manual_and_triage_blocks(self):
+        rows = [budget_row("a", "1", blocked=True, marked=True),
+                budget_row("b", "2", blocked=True, marked=True)]
+        for deployment, marker in zip(rows, (quarantine.CLIPROXY_MANUAL_BLOCK,
+                                              quarantine.TRIAGE_MARKER)):
+            deployment["model_info"][marker] = True
+        client = FakeClient()
+        actions = quarantine.budget_sweep(client, rows, lambda mid: "ok", apply=True)
+        self.assertEqual([action["action"] for action in actions], ["cleared", "cleared"])
+        self.assertTrue(all(deployment["model_info"]["blocked"] for deployment in rows))
+        self.assertNotIn("/model/unblock", [call[1] for call in client.calls])
+
     def test_another_failure_changes_nothing(self):
         rows = [budget_row("a", "1")]
         self.assertEqual(
@@ -121,6 +133,29 @@ class BudgetSweepTest(unittest.TestCase):
 
 
 class SweepTest(unittest.TestCase):
+    def test_group_success_only_clears_synthetic_until_triage_health_recovers(self):
+        triaged = row("g", "triage", blocked=True)
+        triaged["model_info"][quarantine.TRIAGE_MARKER] = True
+        rows = [row("g", "live"), row("g", "synthetic", blocked=True, marked=True), triaged]
+        client = FakeClient()
+        probed = []
+
+        def health(mid):
+            probed.append(mid)
+            return "rate_limited"
+
+        result = quarantine.sweep(client, rows, ["g"], lambda _: (True, ""), True, health=health)
+        self.assertEqual(probed, ["triage"])
+        self.assertEqual([item["deployment"] for item in result], ["synthetic"])
+        self.assertTrue(triaged["model_info"]["blocked"])
+
+        result = quarantine.sweep(
+            client, rows, ["g"], lambda _: (True, ""), True,
+            health=lambda mid: "ok" if mid == "triage" else "unknown",
+        )
+        self.assertEqual([item["deployment"] for item in result], ["triage"])
+        self.assertFalse(triaged["model_info"]["blocked"])
+
     def test_a_failing_group_is_narrowed_not_removed(self):
         rows = [row("g", "a"), row("g", "b")]
         client = FakeClient()
@@ -340,7 +375,8 @@ class LiveFailureSweepTest(unittest.TestCase):
         stats = [{"model_id": "a", "model": "openai/g", "bad": 8}]
         for has_alternative in (False, True):
             with self.subTest(has_alternative=has_alternative):
-                rows = [row("g", "a"), row("g", "b", window=10000)]
+                rows = [row("g", "a"), row("g", "b", window=10000),
+                        row("legacy-batch", "batch")]
                 if has_alternative:
                     rows.append(row("other", "c"))
                 actions = quarantine.live_failure_sweep(FakeClient(), rows, ["g"], stats)
@@ -455,7 +491,7 @@ class CliproxyRecoverySweepTest(unittest.TestCase):
         self.assertEqual(actions, [])
         self.assertEqual(client.calls, [])
 
-    def test_unhealthy_backs_off_but_oauth_change_resets_backoff_and_rate_limit_retries(self):
+    def test_only_permanent_failures_back_off_and_oauth_change_resets_backoff(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -466,19 +502,24 @@ class CliproxyRecoverySweepTest(unittest.TestCase):
             rows = [
                 self._cp_row("gpt-6-astra", "cp-rl", "openai/gpt-6-astra"),
                 self._cp_row("deepseek-v4-pro", "cp-nf", "deepseek/devin/deepseek-v4-pro"),
+                self._cp_row("temporary", "cp-500", "openai/temporary"),
             ]
             probed_1 = []
             def h1(mid):
                 probed_1.append(mid)
-                return "rate_limited" if mid == "cp-rl" else "unhealthy"
+                return {
+                    "cp-rl": ("rate_limited", ""),
+                    "cp-nf": ("unhealthy", "model_not_found"),
+                    "cp-500": ("unhealthy", "503 service unavailable"),
+                }[mid]
 
             client = FakeClient()
             quarantine.cliproxy_recovery_sweep(
                 client, rows, h1, home=home,
-                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro"},
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro", "temporary"},
                 retired=set(), apply=True, workers=1, now=1000.0,
             )
-            self.assertEqual(sorted(probed_1), ["cp-nf", "cp-rl"])
+            self.assertEqual(sorted(probed_1), ["cp-500", "cp-nf", "cp-rl"])
 
             # Second run 15 min later (no oauth change): cp-nf is backed off, cp-rl IS retried!
             probed_2 = []
@@ -487,18 +528,18 @@ class CliproxyRecoverySweepTest(unittest.TestCase):
                 return "ok"
             actions_2 = quarantine.cliproxy_recovery_sweep(
                 client, rows, h2, home=home,
-                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro"},
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro", "temporary"},
                 retired=set(), apply=True, workers=1, now=1900.0,
             )
-            self.assertEqual(probed_2, ["cp-rl"])
-            self.assertEqual([a["deployment"] for a in actions_2], ["cp-rl"])
+            self.assertEqual(probed_2, ["cp-rl", "cp-500"])
+            self.assertEqual([a["deployment"] for a in actions_2], ["cp-rl", "cp-500"])
 
             # Adding a new credential file in oauth/ immediately clears backoff for cp-nf!
             (oauth / "devin-new.json").write_text('{"new": true}')
             probed_3 = []
             actions_3 = quarantine.cliproxy_recovery_sweep(
                 client, rows, lambda mid: (probed_3.append(mid), "ok")[1], home=home,
-                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro"},
+                catalog_ids={"gpt-6-astra", "devin/deepseek-v4-pro", "temporary"},
                 retired=set(), apply=True, workers=1, now=2000.0,
             )
             self.assertEqual(probed_3, ["cp-nf"])
