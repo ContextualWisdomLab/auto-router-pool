@@ -46,6 +46,7 @@ from .maintenance import (
     context_sync_pass,
     effort_suffix_pass,
     health_report,
+    price_sync_pass,
     prompt_cache_drop_pass,
     provider_prefix_pass,
     repair_cooldowns,
@@ -422,6 +423,9 @@ def run(args) -> int:
             )
             output["chat_only_transport"] = chat_only_transport_pass(
                 litellm, rows, apply=args.apply
+            )
+            output["price_sync"] = price_sync_pass(
+                litellm, rows, prices, apply=args.apply
             )
         if args.repair_cooldowns:
             output["cooldowns"] = repair_cooldowns(

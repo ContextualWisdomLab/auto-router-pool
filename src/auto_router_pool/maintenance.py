@@ -16,8 +16,11 @@ import shlex
 import subprocess
 import urllib.parse
 
+import math
+
 from . import catalog
 from .extra_catalogs import atomic
+from .tiers import ROUTERS
 
 REDIS_CONTAINER = os.environ.get("AGENT_GATEWAY_REDIS_CONTAINER", "agent-gateway-redis")
 REDIS_CONF = Path(os.environ.get(
@@ -213,6 +216,178 @@ def effort_suffix_pass(client, rows: list[dict], prices: dict | None = None,
             "action": "updated" if apply else "would_update",
             "from": model, "to": repaired,
         })
+    return changes
+
+
+LOCAL_ZERO_COST_PROVIDERS = frozenset({"lm_studio", "ollama", "ollama_chat"})
+TOKEN_COST_FIELDS = ("input_cost_per_token", "output_cost_per_token")
+MODALITY_COST_FIELDS = (
+    "input_cost_per_image",
+    "output_cost_per_image",
+    "input_cost_per_second",
+    "output_cost_per_second",
+    "input_cost_per_audio_token",
+    "output_cost_per_audio_token",
+    "input_cost_per_audio_per_second",
+)
+ALL_COST_FIELDS = TOKEN_COST_FIELDS + MODALITY_COST_FIELDS
+ROUTING_NAME_SUFFIXES = ("-openrouter", "-nim")
+
+
+def _finite_nonneg(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    val = float(value)
+    if not math.isfinite(val) or val < 0:
+        return None
+    return val
+
+
+def _extract_costs(entry: dict) -> dict[str, float]:
+    costs: dict[str, float] = {}
+    for field in ALL_COST_FIELDS:
+        val = _finite_nonneg(entry.get(field))
+        if val is not None:
+            costs[field] = val
+    return costs
+
+
+def _has_any_cost(info: dict) -> bool:
+    return any(_finite_nonneg(info.get(field)) is not None for field in ALL_COST_FIELDS)
+
+
+def _price_lookup(row: dict, exact_index: dict[str, tuple[str, dict]],
+                  tail_index: dict[str, list[tuple[str, dict]]]) -> tuple[str | None, dict[str, float] | None]:
+    params = row.get("litellm_params") or {}
+    info = row.get("model_info") or {}
+    model_str = str(params.get("model") or "").strip()
+    model_name = str(row.get("model_name") or "").strip()
+    provider = str(params.get("custom_llm_provider") or "").strip().lower()
+    if not provider and "/" in model_str:
+        provider = model_str.split("/", 1)[0].lower()
+    mode = str(info.get("mode") or "chat").lower()
+
+    # 1. Local inference providers and explicit :free upstream tags are $0.0.
+    if provider in LOCAL_ZERO_COST_PROVIDERS or model_str.lower().endswith(":free"):
+        return None, {"input_cost_per_token": 0.0, "output_cost_per_token": 0.0}
+
+    # 2. Exact matches against LiteLLM price map.
+    candidates: list[tuple[int, str, dict]] = []
+    for priority, key in (
+        (0, model_str.lower()),
+        (1, model_name.lower()),
+        (2, str(info.get("base_model") or "").strip().lower()),
+    ):
+        if key and key in exact_index:
+            orig_key, entry = exact_index[key]
+            candidates.append((priority, orig_key, entry))
+
+    # 3. Tail matches (including stripping routing suffixes like -openrouter / -nim).
+    tails: list[str] = []
+    for raw in (model_str, model_name):
+        if not raw:
+            continue
+        t = raw.rsplit("/", 1)[-1].split(":", 1)[0].lower()
+        if t and t not in tails:
+            tails.append(t)
+        for suf in ROUTING_NAME_SUFFIXES:
+            if t.endswith(suf):
+                stripped = t[: -len(suf)]
+                if stripped and stripped not in tails:
+                    tails.append(stripped)
+
+    for tail in tails:
+        for orig_key, entry in tail_index.get(tail, ()):
+            entry_prov = str(entry.get("litellm_provider") or "").lower()
+            entry_mode = str(entry.get("mode") or "chat").lower()
+            score = 10
+            if entry_prov and provider and entry_prov == provider:
+                score -= 4
+            if entry_mode == mode:
+                score -= 2
+            if entry_prov in ("openai", "anthropic", "gemini", "xai", "openrouter"):
+                score -= 1
+            candidates.append((score, orig_key, entry))
+
+    if not candidates:
+        return None, None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    for _, orig_key, entry in candidates:
+        costs = _extract_costs(entry)
+        if not costs:
+            continue
+        if mode in ("chat", "responses", "embedding") and not any(k in costs for k in TOKEN_COST_FIELDS):
+            continue
+        return orig_key, costs
+    return None, None
+
+
+def price_sync_pass(client, rows: list[dict], prices: dict | None = None,
+                    apply: bool = False) -> list[dict]:
+    """Backfill missing pricing metadata on deployments from local/free rules and LiteLLM prices.
+
+    Only deployments missing all cost fields are patched, so an operator's
+    explicit pricing always wins. Internal auto-router groups are skipped.
+    """
+    exact_index: dict[str, tuple[str, dict]] = {}
+    tail_index: dict[str, list[tuple[str, dict]]] = {}
+    for key, entry in (prices or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        if not _extract_costs(entry):
+            continue
+        low = str(key).lower()
+        exact_index.setdefault(low, (str(key), entry))
+        tail = low.rsplit("/", 1)[-1]
+        tail_index.setdefault(tail, []).append((str(key), entry))
+
+    changes = []
+    for row in rows:
+        model_name = str(row.get("model_name") or "")
+        params = row.get("litellm_params") or {}
+        model_str = str(params.get("model") or "")
+        if (
+            not model_name
+            or model_name in ROUTERS
+            or model_name.startswith("__")
+            or model_str.startswith("auto_router/")
+        ):
+            continue
+        info = row.get("model_info") or {}
+        if _has_any_cost(params) or _has_any_cost(info):
+            continue
+        identifier = info.get("id")
+        if not identifier:
+            continue
+
+        matched_key, costs = _price_lookup(row, exact_index, tail_index)
+        if not costs:
+            continue
+
+        patch_body: dict = {"litellm_params": dict(costs)}
+        if matched_key and not info.get("base_model"):
+            patch_body["model_info"] = {"base_model": matched_key}
+
+        if apply:
+            result = client.patch(
+                f"/model/{urllib.parse.quote(identifier, safe='')}/update",
+                patch_body,
+            )
+            if result.get("error_status") is not None:
+                changes.append({
+                    "model": model_name, "deployment": identifier,
+                    "action": "failed", "detail": f"error_{result['error_status']}",
+                })
+                continue
+        entry_rec = {
+            "model": model_name, "deployment": identifier,
+            "action": "updated" if apply else "would_update",
+            "costs": costs,
+        }
+        if matched_key:
+            entry_rec["price_key"] = matched_key
+        changes.append(entry_rec)
     return changes
 
 

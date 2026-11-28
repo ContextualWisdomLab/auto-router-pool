@@ -41,6 +41,10 @@ ANTHROPIC_API = "https://api.anthropic.com"
 ANTHROPIC_OWNER = "anthropic-api-sync-v1"
 ANTHROPIC_MAX = 1024
 
+LMSTUDIO_CREDENTIAL = os.environ.get("LMSTUDIO_CREDENTIAL", "lmstudio")
+LMSTUDIO_OWNER = "lmstudio-sync-v1"
+LMSTUDIO_MAX = 1024
+
 ARGON_PUBLIC = "gemini-4-argon"
 ARGON_UPSTREAMS = ("gemini-4-argon", "gemini-4-argon-high")
 ARGON_CREDENTIAL = "cliproxyapi-shared"
@@ -880,6 +884,268 @@ def sync_argon(client, home: Path, rows: list[dict], apply: bool = False) -> dic
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# LM Studio local inference catalog: the credential (api_base + api_key) lives
+# in the LiteLLM database, so discovery runs inside the LiteLLM container and
+# never prints the key.
+
+
+LMSTUDIO_DISCOVERY = r"""
+import os, json, hashlib, base64, urllib.error, urllib.request
+import psycopg, nacl.secret
+from urllib.parse import urlsplit, urlunsplit
+cred = os.environ.get("LMSTUDIO_CREDENTIAL", "lmstudio")
+u = urlsplit(os.environ["DATABASE_URL"])
+with psycopg.connect(urlunsplit((u.scheme, u.netloc, u.path, "", "")), connect_timeout=5,
+                     options="-c statement_timeout=5000 -c default_transaction_read_only=on") as conn:
+    rows = conn.execute(
+        'SELECT credential_values FROM "LiteLLM_CredentialsTable" WHERE credential_name=%s',
+        (cred,),
+    ).fetchall()
+if len(rows) != 1:
+    raise SystemExit(2)
+salt = os.environ.get("LITELLM_SALT_KEY") or os.environ["LITELLM_MASTER_KEY"]
+box = nacl.secret.SecretBox(hashlib.sha256(salt.encode()).digest())
+def dec(s):
+    if not isinstance(s, str):
+        return s
+    if s.startswith("v2:gcm:"):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        b = base64.urlsafe_b64decode(s[7:])
+        return AESGCM(hashlib.sha256(salt.encode()).digest()).decrypt(b[:12], b[12:], None).decode()
+    try:
+        return box.decrypt(base64.urlsafe_b64decode(s)).decode()
+    except Exception:
+        return s
+values = {k: dec(v) for k, v in rows[0][0].items()}
+base = str(values.get("api_base") or "").rstrip("/")
+if not base:
+    raise SystemExit(3)
+root = base[:-3] if base.endswith("/v1") else base
+key = str(values.get("api_key") or "").strip()
+headers = {"Accept": "application/json"}
+if key:
+    headers["Authorization"] = "Bearer " + key
+data = None
+last_err = None
+for url in (root + "/api/v0/models", base + "/models"):
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            page = json.load(response)
+        items = page.get("data") if isinstance(page, dict) else None
+        if isinstance(items, list):
+            data = items
+            break
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        last_err = str(exc)
+if data is None:
+    raise SystemExit("lmstudio discovery failed: " + str(last_err))
+print(json.dumps({"api_base": base, "models": data}))
+"""
+
+
+def lmstudio_catalog(credential: str = LMSTUDIO_CREDENTIAL) -> tuple[str, list[dict]]:
+    """Query LM Studio through the gateway container using its stored credential."""
+    completed = subprocess.run(
+        [
+            "docker", "exec", "-i",
+            "-e", f"LMSTUDIO_CREDENTIAL={credential}",
+            litellm_container(), "python", "-",
+        ],
+        input=LMSTUDIO_DISCOVERY, text=True, capture_output=True, timeout=60,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip()[:160]
+        raise RuntimeError(
+            f"LM Studio catalog discovery failed with status {completed.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    payload = json.loads(completed.stdout)
+    api_base = payload.get("api_base") if isinstance(payload, dict) else None
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(api_base, str) or not api_base or not isinstance(models, list):
+        raise ValueError("LM Studio catalog response is malformed")
+    return api_base.rstrip("/"), models
+
+
+def lmstudio_public_name(upstream_id: str, colliding_tails: set[str]) -> str:
+    """Slashless public model name; disambiguate only when two models share a tail."""
+    tail = upstream_id.rsplit("/", 1)[-1]
+    if tail in colliding_tails:
+        return upstream_id.replace("/", "-")
+    return tail
+
+
+def plan_lmstudio(models: list[dict], existing: list[dict], api_base: str,
+                  prices: dict | None = None,
+                  credential: str = LMSTUDIO_CREDENTIAL) -> list[tuple[str, dict]]:
+    """Plan LiteLLM deployments for every model currently advertised by LM Studio."""
+    if not isinstance(existing, list) or len(existing) > LMSTUDIO_MAX:
+        raise ValueError("invalid registry or registry exceeds its ceiling")
+    if not isinstance(api_base, str) or not api_base.strip():
+        raise ValueError("LM Studio api_base is required")
+    api_base = api_base.rstrip("/")
+    prices = prices or {}
+
+    valid_models: list[dict] = []
+    seen_ids: set[str] = set()
+    tail_counts: dict[str, int] = {}
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        identifier = model.get("id")
+        if not isinstance(identifier, str) or not identifier.strip():
+            raise ValueError("invalid LM Studio model id")
+        identifier = identifier.strip()
+        if identifier in seen_ids:
+            continue
+        seen_ids.add(identifier)
+        tail = identifier.rsplit("/", 1)[-1]
+        tail_counts[tail] = tail_counts.get(tail, 0) + 1
+        valid_models.append({**model, "id": identifier})
+
+    colliding_tails = {tail for tail, count in tail_counts.items() if count > 1}
+    planned, creates = [], 0
+    for model in valid_models:
+        upstream_id = model["id"]
+        public = lmstudio_public_name(upstream_id, colliding_tails)
+        same = [row for row in existing if row.get("model_name") == public]
+        owned = [
+            row for row in same
+            if row.get("model_info", {}).get("lmstudio_sync") == LMSTUDIO_OWNER
+            and row.get("model_info", {}).get("lmstudio_model_id") == upstream_id
+        ]
+        manual = [
+            row for row in same
+            if row.get("litellm_params", {}).get("litellm_credential_name") == credential
+            and row not in owned
+        ]
+        if len(owned) > 1:
+            raise ValueError("ambiguous LM Studio route for " + public)
+        if manual and not owned:
+            continue  # Never adopt or overwrite a manually configured LM Studio route.
+        previous = owned[0] if owned else None
+
+        orders = []
+        for row in same:
+            if row is previous:
+                continue
+            order = row.get("litellm_params", {}).get("order", 1)
+            if isinstance(order, bool) or not isinstance(order, int):
+                continue
+            orders.append(order)
+        order = previous["litellm_params"].get("order") if previous else (max(orders) if orders else 0) + 1
+        if isinstance(order, bool) or not isinstance(order, int) or order < 1:
+            order = (max(orders) if orders else 0) + 1
+
+        raw_type = str(model.get("type") or "").lower()
+        is_embedding = raw_type in ("embeddings", "embedding") or "embed" in upstream_id.lower()
+        mode = "embedding" if is_embedding else "chat"
+
+        info = dict(previous["model_info"]) if previous else {}
+        info.update({
+            "mode": mode,
+            "litellm_provider": "lm_studio",
+            "lmstudio_sync": LMSTUDIO_OWNER,
+            "lmstudio_model_id": upstream_id,
+        })
+        ctx = model.get("max_context_length")
+        if isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0:
+            info["max_input_tokens"] = ctx
+            if not is_embedding:
+                max_out = min(max(ctx // 4, 4096), 32768)
+                info["max_output_tokens"] = max_out
+                info["max_tokens"] = max_out
+        elif not is_embedding and "max_output_tokens" not in info:
+            info["max_output_tokens"] = 8192
+            info["max_tokens"] = 8192
+
+        if raw_type == "vlm":
+            info["supports_vision"] = True
+        caps = model.get("capabilities")
+        if isinstance(caps, list) and "tool_use" in caps:
+            info["supports_function_calling"] = True
+
+        params = catalog.prompt_cache_drop({
+            "model": "lm_studio/" + upstream_id,
+            "custom_llm_provider": "lm_studio",
+            "api_base": api_base,
+            "litellm_credential_name": credential,
+            "input_cost_per_token": 0.0,
+            "output_cost_per_token": 0.0,
+            "order": order,
+        })
+        if any(params.get(field) for field in ("api_key", "headers", "extra_headers")):
+            raise ValueError("LM Studio route contains a static credential for " + upstream_id)
+
+        body = {"model_name": public, "litellm_params": params, "model_info": info}
+        if previous:
+            same_fields = all(
+                previous[section].get(key) == value
+                for section in ("litellm_params", "model_info")
+                for key, value in body[section].items()
+            )
+            action = "unchanged" if same_fields else "update"
+        else:
+            action = "create"
+            creates += 1
+        planned.append((action, body))
+
+    if len(existing) + creates > LMSTUDIO_MAX:
+        raise ValueError("registry ceiling would be exceeded")
+    return planned
+
+
+def sync_lmstudio(client, home: Path, rows: list[dict], prices: dict | None = None,
+                  apply: bool = False,
+                  credential: str = LMSTUDIO_CREDENTIAL) -> dict:
+    """Discover models on LM Studio and register missing deployments in LiteLLM."""
+    api_base, models = lmstudio_catalog(credential=credential)
+    planned = plan_lmstudio(models, rows, api_base, prices=prices, credential=credential)
+    report = {
+        "checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "api_base": api_base,
+        "credential": credential,
+        "catalog_models": len(models),
+        "planned": {
+            action: sum(item == action for item, _ in planned)
+            for action in ("create", "update", "unchanged")
+        },
+        "models": [body["model_name"] for _, body in planned],
+        "no_models_removed": True,
+    }
+    atomic(home / "lmstudio-sync-preview.json", [{"action": action, **body} for action, body in planned])
+    if apply:
+        created = updated = 0
+        for action, body in planned:
+            if action == "create":
+                result = client.post("/model/new", body)
+                if result.get("error_status") is not None:
+                    raise RuntimeError(
+                        "gateway refused LM Studio registration for "
+                        + body["model_name"]
+                        + ": status "
+                        + str(result["error_status"])
+                    )
+                created += 1
+            elif action == "update":
+                identifier = body["model_info"]["id"]
+                result = client.patch(f"/model/{urllib.parse.quote(identifier, safe='')}/update", body)
+                if result.get("error_status") is not None:
+                    raise RuntimeError(
+                        "gateway refused LM Studio update for "
+                        + body["model_name"]
+                        + ": status "
+                        + str(result["error_status"])
+                    )
+                updated += 1
+        report["created"] = created
+        report["updated"] = updated
+    atomic(home / "lmstudio-sync-report.json", report)
+    return report
+
+
 def sync_all(client, home: Path, rows: list[dict], prices: dict | None = None,
              apply: bool = False) -> dict:
     """Run every provider catalogue, keeping one failure from hiding the rest."""
@@ -890,6 +1156,7 @@ def sync_all(client, home: Path, rows: list[dict], prices: dict | None = None,
         ("cursor_chat", lambda: sync_cursor_chat(client, home, rows, apply)),
         ("anthropic", lambda: sync_anthropic(client, home, rows, prices, apply)),
         ("argon", lambda: sync_argon(client, home, rows, apply)),
+        ("lmstudio", lambda: sync_lmstudio(client, home, rows, prices, apply)),
     ):
         try:
             output[name] = call()

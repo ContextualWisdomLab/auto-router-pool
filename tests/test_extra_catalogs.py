@@ -190,5 +190,83 @@ class CursorCloudTest(unittest.TestCase):
             self.assertTrue((home / "cursor-cloud-model-catalog.json").exists())
 
 
+
+class LMStudioTest(unittest.TestCase):
+    MODELS = [
+        {
+            "id": "google/gemma-4-e4b",
+            "type": "vlm",
+            "max_context_length": 131072,
+            "capabilities": ["tool_use"],
+        },
+        {
+            "id": "text-embedding-nomic-embed-text-v1.5",
+            "type": "embeddings",
+            "max_context_length": 2048,
+        },
+    ]
+
+    def test_plans_chat_vlm_and_embedding_models_with_zero_cost(self):
+        planned = extra.plan_lmstudio(
+            self.MODELS, [], "http://172.21.0.1:12340/v1"
+        )
+        self.assertEqual(len(planned), 2)
+        a0, b0 = planned[0]
+        self.assertEqual(a0, "create")
+        self.assertEqual(b0["model_name"], "gemma-4-e4b")
+        self.assertEqual(b0["litellm_params"]["model"], "lm_studio/google/gemma-4-e4b")
+        self.assertEqual(b0["litellm_params"]["custom_llm_provider"], "lm_studio")
+        self.assertEqual(b0["litellm_params"]["litellm_credential_name"], extra.LMSTUDIO_CREDENTIAL)
+        self.assertEqual(b0["litellm_params"]["api_base"], "http://172.21.0.1:12340/v1")
+        self.assertEqual(b0["model_info"]["mode"], "chat")
+        self.assertEqual(b0["model_info"]["max_input_tokens"], 131072)
+        self.assertEqual(b0["litellm_params"]["input_cost_per_token"], 0.0)
+        self.assertEqual(b0["litellm_params"]["output_cost_per_token"], 0.0)
+        self.assertTrue(b0["model_info"]["supports_vision"])
+        self.assertTrue(b0["model_info"]["supports_function_calling"])
+
+        a1, b1 = planned[1]
+        self.assertEqual(a1, "create")
+        self.assertEqual(b1["model_name"], "text-embedding-nomic-embed-text-v1.5")
+        self.assertEqual(b1["model_info"]["mode"], "embedding")
+        self.assertEqual(b1["model_info"]["max_input_tokens"], 2048)
+        self.assertEqual(b1["litellm_params"]["input_cost_per_token"], 0.0)
+        self.assertEqual(b1["litellm_params"]["output_cost_per_token"], 0.0)
+
+    def test_colliding_tails_are_disambiguated_without_slash(self):
+        models = [{"id": "org-a/shared-model"}, {"id": "org-b/shared-model"}]
+        planned = extra.plan_lmstudio(models, [], "http://172.21.0.1:12340/v1")
+        names = [body["model_name"] for _, body in planned]
+        self.assertEqual(names, ["org-a-shared-model", "org-b-shared-model"])
+
+    def test_manual_route_is_preserved_and_owned_route_is_idempotent(self):
+        manual_rows = [{
+            "model_name": "gemma-4-e4b",
+            "litellm_params": {"litellm_credential_name": extra.LMSTUDIO_CREDENTIAL},
+            "model_info": {},
+        }]
+        planned = extra.plan_lmstudio([self.MODELS[0]], manual_rows, "http://172.21.0.1:12340/v1")
+        self.assertEqual(planned, [])
+
+        created = extra.plan_lmstudio([self.MODELS[0]], [], "http://172.21.0.1:12340/v1")[0][1]
+        existing = [{
+            "model_name": created["model_name"],
+            "litellm_params": dict(created["litellm_params"]),
+            "model_info": {**created["model_info"], "id": "lm-dep-1"},
+        }]
+        replan = extra.plan_lmstudio([self.MODELS[0]], existing, "http://172.21.0.1:12340/v1")
+        self.assertEqual(replan[0][0], "unchanged")
+
+    def test_joins_existing_other_provider_group_with_next_order(self):
+        existing = [{
+            "model_name": "gemma-4-e4b",
+            "litellm_params": {"order": 2, "litellm_credential_name": "OpenRouter"},
+            "model_info": {"id": "or-1"},
+        }]
+        action, body = extra.plan_lmstudio([self.MODELS[0]], existing, "http://172.21.0.1:12340/v1")[0]
+        self.assertEqual(action, "create")
+        self.assertEqual(body["litellm_params"]["order"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
